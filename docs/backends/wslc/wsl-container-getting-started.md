@@ -14,7 +14,7 @@ MXC, which lets you run Linux containers on Windows using the WSLC SDK.
 | Requirement | Details |
 |---|---|
 | **Windows 10 1903 (build 18362.1049)+ on x64, or Windows 10 2004 (build 19041)+ on ARM64** | WSL 2's own [system requirements](https://learn.microsoft.com/windows/wsl/install-manual#step-2---check-requirements-for-running-wsl-2). MXC does not check the OS version itself — see [How an unsupported Windows version is reported](#how-an-unsupported-windows-version-is-reported) below. The WSL runtime package installs only on build 19041 and later, so in practice a 1903/1909 host still needs an upgrade to reach the WSL version below. |
-| **WSL 3.0.3+** | The installed WSL runtime package must meet the WSLC minimum; see Step 1 below for installation |
+| **WSL 3.0.3+** | The installed WSL runtime package must meet the WSLC minimum; see Step 1 below for installation. [Host loopback](#host-loopback) needs WSL 3.0.5+ |
 | **WSLC SDK** | `wslcsdk.dll` is a separate client SDK and must be in the same directory as the running executable (`wxc-exec.exe`, or your own binary when using the Rust SDK) |
 | **Container images** | Reachable from a registry, already cached, or supplied as a local tar |
 
@@ -518,7 +518,7 @@ no separate `--setup-wslc` step is required.
 
 | Exact v0.9 policy | WSLC behavior |
 |---|---|
-| Egress, ingress, and host-loopback defaults all `allow` | Bridged networking without independent directional filtering |
+| Egress, ingress, and host-loopback defaults all `allow` | Bridged networking without independent directional filtering; reaches [host loopback](#host-loopback) on WSL 3.0.5+ |
 | All three defaults `deny` (also the omitted defaults) | No networking (isolated) |
 | Mixed allow/deny directions or egress rules | Rejected; WSLC cannot enforce that combination |
 
@@ -526,6 +526,26 @@ no separate `--setup-wslc` step is required.
 > `CAP_NET_ADMIN`; MXC refuses unsupported rules rather than running them
 > unenforced. The removed legacy `allowOutbound` setting and JSON host-list
 > fields are not accepted by any supported contract.
+
+### Host loopback
+
+On WSL 3.0.5 or later, MXC enables WSL host loopback on every session it
+creates. A bridged container reaches a service bound to Windows `127.0.0.1`
+through the hostname `host.wslc.internal`:
+
+```sh
+wget -qO- http://host.wslc.internal:8080/
+```
+
+- Every Windows loopback TCP port is reachable; there is no per-port filter.
+
+- On WSL older than 3.0.5, the name doesn't resolve and containers can't
+  reach Windows loopback.
+
+- **Behavior change:** after updating to WSL 3.0.5, existing all-`allow`
+  configs gain outbound access to Windows loopback services.
+
+- Inbound connections from Windows still need declared port mappings.
 
 ### Network proxy (cooperative, unprivileged)
 
@@ -553,8 +573,10 @@ variables that well-behaved clients honor.
 
 **The runtime field contains a URL string.** A WSLC container runs in its own
 network namespace (a separate WSL system VM). Its own `127.0.0.1` loopback is
-valid for a proxy running inside that container, as in the test fixture below;
-a proxy on the host's or WSL distro's loopback is **not reachable**. An external
+valid for a proxy running inside that container, as in the test fixture below.
+The host's or WSL distro's `127.0.0.1` is **not reachable** at that address; on
+WSL 3.0.5 or later, a proxy on Windows loopback is reachable through
+`host.wslc.internal` (see [Host loopback](#host-loopback)). An external
 proxy must have an address routable from the container:
 
 ```json
@@ -779,6 +801,7 @@ images — cannot be used.
 
 - [`tests/examples/wslc_hello_world.json`](../../../tests/examples/wslc_hello_world.json) — Hello world with Alpine
 - [`tests/configs/wslc_network_isolated.json`](../../../tests/configs/wslc_network_isolated.json) — Network isolation
+- [`tests/configs/wslc_network_host_loopback.json`](../../../tests/configs/wslc_network_host_loopback.json) — Bridged container reaches a Windows `127.0.0.1` service through `host.wslc.internal` (driven by `run_wslc_host_loopback_test.ps1`)
 - [`tests/configs/wslc_network_proxy.json`](../../../tests/configs/wslc_network_proxy.json) — In-container cooperative HTTP proxy (`runtimeConfig.networkProxy` at the container's `127.0.0.1`)
 - [`tests/configs/wslc_custom_registry_ghcr.json`](../../../tests/configs/wslc_custom_registry_ghcr.json) — Pull from GitHub Container Registry
 - [`tests/configs/wslc_custom_registry_quay.json`](../../../tests/configs/wslc_custom_registry_quay.json) — Pull from Quay.io

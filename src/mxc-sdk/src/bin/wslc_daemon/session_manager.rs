@@ -50,6 +50,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use mxc_sdk::mxc_common::logger::{Logger, Mode};
 use mxc_sdk::mxc_common::models::{FailurePhase, ScriptResponse};
+use mxc_sdk::mxc_common::proxy_env::apply_cooperative_proxy_env;
 use mxc_sdk::wslc_common::container_steps::{
     self, OutStream, OutputSink, ProcessSettings, SessionSizing, StdinConsumer,
 };
@@ -58,6 +59,7 @@ use mxc_sdk::wslc_common::daemon_protocol::{
     PortMapping, ProvisionConfig, ProvisionSessionConfig, StartConfig, StopConfig,
 };
 use mxc_sdk::wslc_common::image;
+use mxc_sdk::wslc_common::policy;
 use mxc_sdk::wslc_common::policy_mapping;
 use mxc_sdk::wslc_common::process_env::EnvScope;
 use mxc_sdk::wslc_common::store_slots::{StoreSlotLease, StoreSlotPool};
@@ -401,6 +403,22 @@ fn start_exec(
     // A spawn failure drops the guard along with the closure, so there is no
     // release to do here.
     spawned.map(|_| ())
+}
+
+/// `env` with the cooperative proxy variables pointed at `proxy_url`.
+fn with_proxy_env(env: &[(String, String)], proxy_url: &str) -> Vec<(String, String)> {
+    let entries: Vec<String> = env
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    apply_cooperative_proxy_env(&entries, proxy_url)
+        .into_iter()
+        .filter_map(|entry| {
+            entry
+                .split_once('=')
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 /// The off-worker half of an exec: run it to completion and classify it.
@@ -788,16 +806,18 @@ impl SessionHandle {
             &cancellation,
             stdin_relay,
         )?);
-        self.send(WorkerCommand::Container(ContainerWork::Exec(ExecRequest {
-            config,
-            sink,
-            cancellation,
-            stdin,
-            registration: Arc::clone(&registration),
-            admit,
-            done,
-            slot,
-        })))?;
+        self.send(WorkerCommand::Container(ContainerWork::Exec(Box::new(
+            ExecRequest {
+                config,
+                sink,
+                cancellation,
+                stdin,
+                registration: Arc::clone(&registration),
+                admit,
+                done,
+                slot,
+            },
+        ))))?;
         admit_rx.await.map_err(worker_gone)??;
         Ok(ExecStream {
             done: done_rx,
@@ -935,6 +955,9 @@ struct ContainerEntry {
     /// Keeps a quarantined sandbox counted against exec capacity, because a run
     /// whose termination was never confirmed may still hold a live process.
     exec_slot: Option<ExecSlotGuard>,
+
+    /// The cooperative proxy URL set at provision, applied to every exec.
+    network_proxy: Option<String>,
 }
 
 /// A provision waiting on its image to arrive from a registry.
@@ -963,7 +986,7 @@ pub(crate) enum ContainerWork {
     /// unknown, not-started or already-busy sandbox is a pre-admission typed
     /// error, never a post-admission stream `Error`); `done` carries the run's
     /// exit code once [`WorkerCommand::ExecFinished`] lands.
-    Exec(ExecRequest),
+    Exec(Box<ExecRequest>),
     Start {
         config: StartConfig,
         reply: oneshot::Sender<Result<(), WorkerError>>,
@@ -2340,6 +2363,7 @@ impl Worker {
                 container,
                 session_ref: session_ref.to_string(),
                 exec_slot: None,
+                network_proxy: config.network_proxy.clone(),
             },
         );
         Ok(sandbox_id)
@@ -2401,7 +2425,7 @@ impl Worker {
         if let Some(in_flight) = self.exec_in_flight.get_mut(work.sandbox_id()) {
             match work {
                 ContainerWork::Exec(request) => {
-                    let ExecRequest { config, admit, .. } = request;
+                    let ExecRequest { config, admit, .. } = *request;
                     let _ = admit.send(Err(WorkerError::Busy(config.sandbox_id)));
                 }
                 lifecycle => in_flight.parked.push(lifecycle),
@@ -2410,7 +2434,7 @@ impl Worker {
         }
 
         match work {
-            ContainerWork::Exec(request) => self.begin_exec(request, worker),
+            ContainerWork::Exec(request) => self.begin_exec(*request, worker),
             ContainerWork::Start { config, reply } => {
                 let _ = reply.send(self.start(config));
             }
@@ -2447,6 +2471,21 @@ impl Worker {
                 return;
             }
         };
+
+        let mut config = config;
+        let provisioned = self.containers[&config.sandbox_id].network_proxy.as_deref();
+        match policy::resolve_exec_proxy(
+            provisioned,
+            config.network_proxy.as_deref(),
+            config.env_scope,
+        ) {
+            Ok(Some(proxy_url)) => config.env = with_proxy_env(&config.env, proxy_url),
+            Ok(None) => {}
+            Err(message) => {
+                let _ = admit.send(Err(WorkerError::Rejected(anyhow::anyhow!(message))));
+                return;
+            }
+        }
 
         // Recorded here rather than looked up when the run reports, because
         // quarantine can delete the container entry while the run is still
@@ -3254,6 +3293,7 @@ mod tests {
             container: unsafe { WslcContainerGuard::from_raw(sentinel, release_noop) },
             session_ref: TEST_SESSION.to_string(),
             exec_slot: None,
+            network_proxy: None,
         }
     }
 
@@ -3293,6 +3333,7 @@ mod tests {
                     network: Default::default(),
                     port_mappings: Vec::new(),
                     session_ref: None,
+                    network_proxy: None,
                 },
                 reply,
                 session_ref: TEST_SESSION.to_string(),
@@ -3322,6 +3363,7 @@ mod tests {
                     network: Default::default(),
                     port_mappings: Vec::new(),
                     session_ref: None,
+                    network_proxy: None,
                 },
                 reply,
                 session_ref: TEST_SESSION.to_string(),
@@ -3474,6 +3516,7 @@ mod tests {
             network: Default::default(),
             port_mappings: Vec::new(),
             session_ref: None,
+            network_proxy: None,
         }
     }
 
@@ -3542,6 +3585,7 @@ mod tests {
                     network: Default::default(),
                     port_mappings: Vec::new(),
                     session_ref: None,
+                    network_proxy: None,
                 },
                 reply,
                 session_ref: TEST_SESSION.to_string(),
@@ -3795,6 +3839,7 @@ mod tests {
                     network: Default::default(),
                     port_mappings: Vec::new(),
                     session_ref: None,
+                    network_proxy: None,
                 },
                 parked,
             ));
@@ -5203,6 +5248,7 @@ mod tests {
                     env_scope: EnvScope::Merge,
                     timeout_ms: 0,
                     stdin: false,
+                    network_proxy: None,
                 },
                 None,
             )
@@ -5267,6 +5313,7 @@ mod tests {
                     env_scope: EnvScope::Merge,
                     timeout_ms: 0,
                     stdin: false,
+                    network_proxy: None,
                 },
                 None,
             )
@@ -5495,6 +5542,7 @@ mod tests {
             container: unsafe { WslcContainerGuard::from_raw(sentinel, release) },
             session_ref: TEST_SESSION.to_string(),
             exec_slot: None,
+            network_proxy: None,
         }
     }
 
@@ -5549,7 +5597,7 @@ mod tests {
             Arc::new(register_exec(&active_execs, exec_id, "run", &cancellation, None).unwrap());
         let sink: OutputSink = Box::new(|_, _| {});
         TestExec {
-            work: ContainerWork::Exec(ExecRequest {
+            work: ContainerWork::Exec(Box::new(ExecRequest {
                 config: ExecConfig {
                     exec_id: exec_id.to_string(),
                     run_token: "run".to_string(),
@@ -5560,6 +5608,7 @@ mod tests {
                     env_scope: EnvScope::Merge,
                     timeout_ms: 0,
                     stdin: false,
+                    network_proxy: None,
                 },
                 sink,
                 cancellation: Arc::clone(&cancellation),
@@ -5568,7 +5617,7 @@ mod tests {
                 admit,
                 done,
                 slot,
-            }),
+            })),
             admit: admit_rx,
             done: done_rx,
             cancellation,
@@ -5756,6 +5805,7 @@ mod tests {
                         env_scope: EnvScope::Merge,
                         timeout_ms: 0,
                         stdin: false,
+                        network_proxy: None,
                     },
                     Some(Arc::new(permit)),
                 )
@@ -5951,6 +6001,102 @@ mod tests {
             queued.done.try_recv().unwrap().unwrap(),
             ExecTerminal::Cancelled
         );
+    }
+
+    /// Dispatch one exec on a container provisioned with `provisioned_proxy`,
+    /// returning its admission and the config the runner received, if any.
+    fn admit_proxied_exec(
+        provisioned_proxy: Option<&str>,
+        requested_proxy: Option<&str>,
+        env_scope: EnvScope,
+    ) -> (Result<(), WorkerError>, Option<ExecConfig>) {
+        thread_local! {
+            static STARTED: std::cell::RefCell<Option<ExecConfig>> = const { std::cell::RefCell::new(None) };
+        }
+
+        fn record_config(
+            _: &Worker,
+            config: ExecConfig,
+            _: WslcContainer,
+            _: OutputSink,
+            _: Arc<AtomicBool>,
+            _: Option<StdinSource>,
+            _: &mpsc::UnboundedSender<WorkerCommand>,
+        ) -> Result<(), WorkerError> {
+            STARTED.with(|started| *started.borrow_mut() = Some(config));
+            Ok(())
+        }
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut worker = worker_that_can_run();
+        worker.start_run = record_config;
+        worker
+            .containers
+            .get_mut("wslc:ready")
+            .unwrap()
+            .network_proxy = provisioned_proxy.map(str::to_string);
+        let mut exec = exec_work("wslc:ready", "proxied");
+        let ContainerWork::Exec(request) = &mut exec.work else {
+            unreachable!()
+        };
+        request.config.env = vec![
+            ("FOO".to_string(), "bar".to_string()),
+            (
+                "HTTP_PROXY".to_string(),
+                "http://attacker.invalid:1".to_string(),
+            ),
+        ];
+        request.config.env_scope = env_scope;
+        request.config.network_proxy = requested_proxy.map(str::to_string);
+
+        STARTED.with(|started| started.borrow_mut().take());
+        worker.dispatch(exec.work, &tx);
+        let admitted = exec.admit.try_recv().unwrap();
+        (
+            admitted,
+            STARTED.with(|started| started.borrow_mut().take()),
+        )
+    }
+
+    #[test]
+    fn an_exec_runs_under_the_proxy_set_at_provision() {
+        let provisioned = "http://proxy.example:8080";
+        for requested in [None, Some(provisioned)] {
+            let (admitted, started) =
+                admit_proxied_exec(Some(provisioned), requested, EnvScope::Merge);
+            admitted.unwrap();
+            let env = started.expect("the exec must reach the runner").env;
+            let value = |name: &str| env.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+            assert_eq!(value("FOO"), Some("bar"));
+            assert_eq!(value("HTTP_PROXY"), Some(provisioned));
+            assert_eq!(value("NO_PROXY"), Some(""));
+            assert!(!env.iter().any(|(_, v)| v.contains("attacker")));
+        }
+    }
+
+    #[test]
+    fn an_exec_naming_a_different_proxy_than_provision_is_rejected() {
+        let (admitted, started) = admit_proxied_exec(
+            Some("http://proxy.example:8080"),
+            Some("http://other.example:8080"),
+            EnvScope::Merge,
+        );
+        assert!(matches!(admitted, Err(WorkerError::Rejected(_))));
+        assert!(started.is_none());
+    }
+
+    #[test]
+    fn a_replaced_environment_refuses_a_credential_bearing_provisioned_proxy() {
+        let (admitted, started) = admit_proxied_exec(
+            Some("http://user:hunter2@proxy.example:8080"),
+            None,
+            EnvScope::Replace,
+        );
+        let Err(WorkerError::Rejected(e)) = admitted else {
+            panic!("expected a rejection, got {admitted:?}");
+        };
+        assert!(!format!("{e:#}").contains("hunter2"));
+        assert!(started.is_none());
     }
 
     #[test]
@@ -6213,6 +6359,7 @@ mod tests {
                     network: Default::default(),
                     port_mappings: Vec::new(),
                     session_ref: None,
+                    network_proxy: None,
                 },
                 reply,
                 session_ref: TEST_SESSION.to_string(),
@@ -6379,6 +6526,7 @@ mod tests {
                         env_scope: EnvScope::Merge,
                         timeout_ms: 30_000,
                         stdin: false,
+                        network_proxy: None,
                     },
                     None,
                 )
@@ -6404,6 +6552,7 @@ mod tests {
                     network: Default::default(),
                     port_mappings: Vec::new(),
                     session_ref: Some(session_ref.to_string()),
+                    network_proxy: None,
                 })
                 .await
                 .expect("provision into the named session");
@@ -6613,6 +6762,7 @@ mod tests {
                 network: Default::default(),
                 port_mappings: Vec::new(),
                 session_ref: Some(session_ref.to_string()),
+                network_proxy: None,
             })
             .await
         {
@@ -6641,6 +6791,7 @@ mod tests {
                     env_scope: EnvScope::Merge,
                     timeout_ms: 30_000,
                     stdin: false,
+                    network_proxy: None,
                 },
                 None,
             )
@@ -6861,6 +7012,7 @@ mod tests {
                 network: Default::default(),
                 port_mappings: Vec::new(),
                 session_ref: Some(session_ref.clone()),
+                network_proxy: None,
             })
             .await
             .expect("provision into the named session");
@@ -6897,6 +7049,7 @@ mod tests {
                 network: Default::default(),
                 port_mappings: Vec::new(),
                 session_ref: None,
+                network_proxy: None,
             })
             .await
             .unwrap();
@@ -6933,6 +7086,7 @@ mod tests {
             env_scope: EnvScope::Merge,
             timeout_ms: 30_000,
             stdin: false,
+            network_proxy: None,
         }
     }
 
@@ -6987,6 +7141,7 @@ mod tests {
                 network: Default::default(),
                 port_mappings: Vec::new(),
                 session_ref: None,
+                network_proxy: None,
             })
             .await
             .unwrap();
@@ -7011,6 +7166,7 @@ mod tests {
                     env_scope: EnvScope::Merge,
                     timeout_ms: 30_000,
                     stdin: false,
+                    network_proxy: None,
                 },
                 None,
             )
@@ -7064,6 +7220,7 @@ mod tests {
                     network: Default::default(),
                     port_mappings: Vec::new(),
                     session_ref: None,
+                    network_proxy: None,
                 })
                 .await
         });
@@ -7083,6 +7240,7 @@ mod tests {
                         env_scope: EnvScope::Merge,
                         timeout_ms: 30_000,
                         stdin: false,
+                        network_proxy: None,
                     },
                     None,
                 )
@@ -7126,6 +7284,7 @@ mod tests {
                     env_scope: EnvScope::Merge,
                     timeout_ms: 30_000,
                     stdin: false,
+                    network_proxy: None,
                 },
                 None,
             )
@@ -7171,6 +7330,7 @@ mod tests {
                     env_scope: EnvScope::Merge,
                     timeout_ms: 30_000,
                     stdin: false,
+                    network_proxy: None,
                 },
                 None,
             )
@@ -7233,6 +7393,7 @@ mod tests {
                 network: Default::default(),
                 port_mappings: Vec::new(),
                 session_ref: None,
+                network_proxy: None,
             })
             .await
             .unwrap();
@@ -7255,6 +7416,7 @@ mod tests {
                     env_scope: EnvScope::Merge,
                     timeout_ms: 30_000,
                     stdin: false,
+                    network_proxy: None,
                 },
                 None,
             )

@@ -60,8 +60,14 @@ fn surface_attached_warnings(logger: &mut Logger, mut surface: impl FnMut(&str))
     }
 }
 
-/// Merge operation and telemetry warnings into the envelope's `result.warnings`.
-/// Existing entries are preserved and duplicates suppressed.
+/// Merge `warnings` from telemetry initialisation into the envelope's
+/// `result.warnings` array. Existing entries in the array are preserved and
+/// duplicates suppressed so the field remains a stable set-like list.
+///
+/// This mirrors what the ordinary SDK `spawn` path does for streaming
+/// invocations (see `ProcessWithWarnings::wrap` in `lib.rs`): both entry
+/// points buffer telemetry-init diagnostics in a `Logger` and must surface
+/// them to the caller instead of dropping them on the floor.
 fn inject_warnings(outcome: &mut Result<DispatchOutcome, MxcError>, warnings: &[String]) {
     if warnings.is_empty() {
         return;
@@ -141,9 +147,7 @@ pub fn run_state_aware(
                 bound,
                 dry_run,
             );
-            let mut outcome = runner.finish(outcome);
-            inject_warnings(&mut outcome, &runner.take_warnings());
-            outcome
+            runner.finish(outcome)
         }
         #[cfg(not(all(target_os = "windows", feature = "wslc")))]
         crate::mxc_common::models::ContainmentBackend::Wslc => Err(wslc_unavailable()),

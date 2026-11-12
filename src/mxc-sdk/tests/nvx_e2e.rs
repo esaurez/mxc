@@ -205,6 +205,7 @@ fn unsupported_platform_or_feature_is_fail_closed() {
 
 #[cfg(all(windows, target_arch = "x86_64", feature = "microvm"))]
 mod windows_x64 {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Component, Path, PathBuf, Prefix};
     use std::process::{Command, Output, Stdio};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -220,12 +221,40 @@ mod windows_x64 {
         "NVX signed bundled agent: combined stdout/stderr capture limit of 67108864 bytes exceeded";
 
     #[test]
-    fn streaming_and_lifecycle_validation_reach_the_crate_without_a_vm() {
+    fn native_validation_rejects_requests_without_booting_a_vm() {
         const CHILD: &str = "MXC_NVX_PHASE3_VALIDATION_CHILD";
         if std::env::var_os(CHILD).is_some() {
             let options = dev::JsonOptions { experimental: true };
+            for source in ["{ not json".to_owned(), {
+                let mut request = process_only_request("printf forbidden");
+                request["microvm"]["provision"] = json!({"memoryMib": 0});
+                request.to_string()
+            }] {
+                let error = dev::run_json(&source, options).unwrap_err();
+                assert_eq!(error.code, ErrorCode::MalformedRequest, "{error}");
+                let error = dev::spawn_json(&source, options)
+                    .err()
+                    .expect("malformed request must not spawn");
+                assert_eq!(error.code, ErrorCode::MalformedRequest, "{error}");
+            }
+            let mut credentialed = process_only_request("printf forbidden");
+            credentialed["network"] = json!({"egress": {"default": "deny"}});
+            credentialed["runtimeConfig"] = json!({
+                "networkProxy": "http://synthetic-user:synthetic-secret@localhost:3128"
+            });
+            let error = dev::run_json(&credentialed.to_string(), options).unwrap_err();
+            assert_eq!(error.code, ErrorCode::PolicyValidation, "{error}");
+            assert!(error.message.contains("validate_provision"), "{error}");
+            assert!(error.message.contains("withheld"), "{error}");
+            assert!(!format!("{error:?}").contains("synthetic"));
             let mut request = process_only_request("printf forbidden");
             request["runtimeConfig"] = json!({"networkProxy": "http://[::1]:3128"});
+            let error = dev::run_json(&request.to_string(), options).unwrap_err();
+            assert_eq!(error.code, ErrorCode::PolicyValidation, "{error}");
+            assert!(
+                error.message.contains("OpenVMM reaches host loopback"),
+                "{error}"
+            );
             let error = dev::spawn_json(&request.to_string(), options)
                 .err()
                 .expect("native proxy rejection");
@@ -237,19 +266,26 @@ mod windows_x64 {
             request.as_object_mut().unwrap().remove("process");
             request["phase"] = json!("provision");
             request["microvm"]["provision"] = json!({"memoryMib": 256});
-            let error = dev::validate_provision_json(&request.to_string(), options).unwrap_err();
-            assert_eq!(error.code, ErrorCode::PolicyValidation, "{error}");
-            assert!(
-                error.message.contains("OpenVMM reaches host loopback"),
-                "{error}"
-            );
+            for validate in [false, true] {
+                let error = if validate {
+                    dev::validate_provision_json(&request.to_string(), options)
+                } else {
+                    dev::provision_container_json(&request.to_string(), options)
+                }
+                .unwrap_err();
+                assert_eq!(error.code, ErrorCode::PolicyValidation, "{error}");
+                assert!(
+                    error.message.contains("OpenVMM reaches host loopback"),
+                    "{error}"
+                );
+            }
             return;
         }
         let state = tempfile::tempdir().unwrap();
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "windows_x64::streaming_and_lifecycle_validation_reach_the_crate_without_a_vm",
+                "windows_x64::native_validation_rejects_requests_without_booting_a_vm",
                 "--nocapture",
             ])
             .env(CHILD, "1")
@@ -262,6 +298,19 @@ mod windows_x64 {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        // Rejected requests never boot VMs, including the ones that capture templates.
+        let agent_state = state.path().join(r"Microsoft\MXC\nvx");
+        let template_stores: Vec<PathBuf> = std::iter::once(agent_state.clone())
+            .chain(
+                std::fs::read_dir(&agent_state)
+                    .expect("agent state directories")
+                    .map(|entry| entry.expect("agent state directory").path()),
+            )
+            .map(|directory| directory.join("templates"))
+            .filter(|store| store.exists())
+            .collect();
+        assert!(template_stores.is_empty(), "{template_stores:?}");
+        assert_template_captures(&String::from_utf8_lossy(&output.stderr), 0);
     }
 
     #[test]
@@ -368,11 +417,32 @@ mod windows_x64 {
         dry_run: bool,
         environment: &[(&str, &std::ffi::OsStr)],
     ) -> Output {
+        executor_output_with_log(request, missing_bundle, dry_run, environment).0
+    }
+
+    fn executor_output_with_log(
+        request: &Value,
+        missing_bundle: bool,
+        dry_run: bool,
+        environment: &[(&str, &std::ffi::OsStr)],
+    ) -> (Output, String) {
         let directory = tempfile::tempdir().expect("executor request directory");
         let path = directory.path().join("request.json");
-        std::fs::write(&path, request.to_string()).expect("write executor request");
+        let log_path = directory.path().join("executor.log");
+        let mut request = request.clone();
         let mut command = Command::new(executor());
-        command.arg("--experimental").arg(&path);
+        command
+            .arg("--experimental")
+            .arg("--log-file")
+            .arg(&log_path);
+        if let Some(phase) = request.as_object_mut().unwrap().remove("phase") {
+            command.arg("--operation").arg(phase.as_str().unwrap());
+            if let Some(id) = request.as_object_mut().unwrap().remove("sandboxId") {
+                command.arg("--container-id").arg(id.as_str().unwrap());
+            }
+        }
+        std::fs::write(&path, request.to_string()).expect("write executor request");
+        command.arg(&path);
         if dry_run {
             command.arg("--dry-run");
         }
@@ -389,7 +459,8 @@ mod windows_x64 {
         let pid = child.id();
         let output = child.wait_with_output().expect("MXC executor output");
         assert_no_run_state(pid);
-        output
+        let log = std::fs::read_to_string(log_path).expect("executor diagnostic log");
+        (output, log)
     }
 
     #[test]
@@ -820,7 +891,7 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
             stdout.contains("Dry run completed. Result: validation passed"),
             "{stdout}"
         );
-        assert!(!stdout.contains("forbidden"), "{stdout}");
+        assert!(!stdout.lines().any(|line| line == "forbidden"), "{stdout}");
 
         let mut invalid_proxy = valid.clone();
         invalid_proxy["runtimeConfig"] = json!({"networkProxy": "http://[::1]:3128"});
@@ -829,7 +900,12 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("policy_validation"), "{stderr}");
         assert!(stderr.contains("OpenVMM reaches host loopback"), "{stderr}");
-        assert!(!String::from_utf8_lossy(&output.stdout).contains("forbidden"));
+        assert!(
+            !String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == "forbidden"),
+            "{output:?}"
+        );
 
         invalid_proxy["runtimeConfig"] =
             json!({"networkProxy": "http://synthetic:secret@[::1]:3128"});
@@ -967,7 +1043,7 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
 
         const CHILD_ENV: &str = "MXC_NVX_CONSOLE_CHILD";
         if std::env::var_os(CHILD_ENV).is_none() {
-            for phase in ["startup", "execution"] {
+            for phase in ["capture", "startup", "execution"] {
                 // A separate console prevents Ctrl-C from reaching the suite or other sessions.
                 let output = Command::new(std::env::current_exe().expect("test executable"))
                     .args([
@@ -988,7 +1064,7 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
                 );
             }
             println!(
-                "VM_EXECUTED executor console interruption startup/execution/owned-vmm/cleanup"
+                "VM_EXECUTED executor console interruption capture/startup/execution/owned-vmm/cleanup"
             );
             return;
         }
@@ -996,6 +1072,8 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         unsafe extern "system" fn helper_handler(event: u32) -> windows::core::BOOL {
             windows::core::BOOL(i32::from(event == CTRL_C_EVENT))
         }
+        // An inherited ignore-Ctrl-C flag also propagates to the executor.
+        unsafe { SetConsoleCtrlHandler(None, false) }.expect("enable child Ctrl-C delivery");
         unsafe { SetConsoleCtrlHandler(Some(helper_handler), true) }
             .expect("helper control handler");
 
@@ -1029,7 +1107,7 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
             }
         }
 
-        fn owned_vmm(pid: u32) -> Option<OwnedHandle> {
+        fn owned_vmms(pid: u32) -> Vec<OwnedHandle> {
             let snapshot = OwnedHandle::new(
                 unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
                     .expect("process snapshot"),
@@ -1038,11 +1116,12 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
                 dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
                 ..Default::default()
             };
+            let mut vmms = Vec::new();
             let mut next = unsafe { Process32FirstW(snapshot.get(), &mut entry) };
             loop {
                 match next {
                     Ok(()) => {}
-                    Err(error) if error.code() == ERROR_NO_MORE_FILES.to_hresult() => return None,
+                    Err(error) if error.code() == ERROR_NO_MORE_FILES.to_hresult() => return vmms,
                     Err(error) => panic!("process enumeration failed: {error}"),
                 }
                 let end = entry
@@ -1052,15 +1131,16 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
                     .unwrap_or(entry.szExeFile.len());
                 let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
                 if entry.th32ParentProcessID == pid && name.eq_ignore_ascii_case("openvmm.exe") {
-                    let handle = unsafe {
+                    // A template capture's VM can exit before it is opened.
+                    if let Ok(handle) = unsafe {
                         OpenProcess(
                             PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
                             false,
                             entry.th32ProcessID,
                         )
+                    } {
+                        vmms.push(OwnedHandle::new(handle));
                     }
-                    .expect("owned OpenVMM handle");
-                    return Some(OwnedHandle::new(handle));
                 }
                 next = unsafe { Process32NextW(snapshot.get(), &mut entry) };
             }
@@ -1069,6 +1149,23 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         let directory = tempfile::tempdir().expect("interruption test directory");
         let state = directory.path().join("state");
         std::fs::create_dir(&state).expect("isolated state directory");
+        let phase = std::env::var(CHILD_ENV).expect("interruption phase");
+        if phase != "capture" {
+            // Capture the platform snapshot templates and register the image first, so the first
+            // VM of the interrupted request is its own sandbox rather than a template capture.
+            let warm = executor_output_with_env(
+                &process_only_request("printf warm"),
+                false,
+                false,
+                &[("LOCALAPPDATA", state.as_os_str())],
+            );
+            assert_eq!(
+                warm.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&warm.stderr)
+            );
+        }
         let request_path = directory.path().join("request.json");
         let log_path = directory.path().join("executor.log");
         let stdout_path = directory.path().join("stdout");
@@ -1091,7 +1188,6 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
                 .expect("interruptible executor"),
             vmm: None,
         };
-        let phase = std::env::var(CHILD_ENV).expect("interruption phase");
         let ready_deadline = Instant::now() + Duration::from_secs(180);
         loop {
             assert!(
@@ -1100,17 +1196,25 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
                 std::fs::read_to_string(&stderr_path).expect("executor stderr")
             );
             if guard.vmm.is_none() {
-                guard.vmm = owned_vmm(guard.child.id());
+                guard.vmm = owned_vmms(guard.child.id()).into_iter().next();
             }
-            let executing = match std::fs::read_to_string(&log_path) {
-                Ok(log) => log.contains("NVX execution started"),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            let log = match std::fs::read_to_string(&log_path) {
+                Ok(log) => log,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
                 Err(error) => panic!("executor log read failed: {error}"),
             };
-            if guard.vmm.is_some() && (phase == "startup" || executing) {
+            // The request logs its sandbox's identity before starting it, so a VM that runs
+            // before then captures a template.
+            let provisioned = log.contains("mxc.SandboxIdentity");
+            let executing = log.contains("NVX execution started");
+            if guard.vmm.is_some() && (phase != "execution" || executing) {
                 assert!(
-                    phase != "startup" || !executing,
-                    "missed the startup interruption window"
+                    match phase.as_str() {
+                        "capture" => !provisioned,
+                        "startup" => !executing,
+                        _ => true,
+                    },
+                    "missed the {phase} interruption window"
                 );
                 break;
             }
@@ -1142,6 +1246,13 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
             WAIT_OBJECT_0,
             "owned OpenVMM is still running",
         );
+        for vmm in owned_vmms(guard.child.id()) {
+            assert_eq!(
+                unsafe { WaitForSingleObject(vmm.get(), 0) },
+                WAIT_OBJECT_0,
+                "an OpenVMM that the executor started is still running",
+            );
+        }
         // The cancelled request must leave the shared agent state directory usable.
         let after = executor_output_with_env(
             &process_only_request("printf after-interrupt"),
@@ -1162,9 +1273,13 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         let stderr = std::fs::read_to_string(&stderr_path).expect("cancellation stderr");
         assert!(stderr.contains("execution cancelled"), "{stderr}");
         assert!(!stderr.contains("timed out"), "{stderr}");
-        assert!(std::fs::read_to_string(&log_path)
-            .expect("teardown log")
-            .contains("mxc.SandboxTornDown"));
+        let log = std::fs::read_to_string(&log_path).expect("teardown log");
+        if phase == "capture" {
+            // Cancellation during the capture ends the request before it provisions a sandbox.
+            assert!(!log.contains("mxc.SandboxIdentity"), "{log}");
+        } else {
+            assert!(log.contains("mxc.SandboxTornDown"), "{log}");
+        }
         unsafe { SetConsoleCtrlHandler(Some(helper_handler), false) }
             .expect("remove helper handler");
     }
@@ -1250,34 +1365,60 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
             ("HTTPS_PROXY", OsStr::new("http://127.0.0.1:9")),
             ("HTTP_PROXY", OsStr::new("http://127.0.0.1:9")),
         ];
+        let marker = nonce();
         let request = process_only_request("printf registered");
         let image = request["microvm"]["image"]
             .as_str()
             .expect("image reference");
         let run_concurrently = |environment: &[(&str, &OsStr)]| {
-            let outputs: Vec<Output> = std::thread::scope(|scope| {
+            let outputs: Vec<(Output, String)> = std::thread::scope(|scope| {
                 let runs: Vec<_> = (0..3)
-                    .map(|_| {
-                        scope
-                            .spawn(|| executor_output_with_env(&request, false, false, environment))
+                    .map(|index| {
+                        let request = process_only_request(&format!(
+                            "test ! -e /tmp/{marker} || exit 99; touch /tmp/{marker}; \
+                             printf registered-{index}"
+                        ));
+                        scope.spawn(move || {
+                            executor_output_with_log(&request, false, false, environment)
+                        })
                     })
                     .collect();
                 runs.into_iter()
                     .map(|run| run.join().expect("concurrent executor"))
                     .collect()
             });
-            for output in outputs {
+            let mut identities = BTreeSet::new();
+            let mut templates = Vec::new();
+            let mut diagnostics = String::new();
+            for (index, (output, log)) in outputs.into_iter().enumerate() {
                 assert_eq!(
                     output.status.code(),
                     Some(0),
                     "{}",
                     String::from_utf8_lossy(&output.stderr)
                 );
-                assert_eq!(output.stdout, b"registered");
+                assert_eq!(output.stdout, format!("registered-{index}").as_bytes());
+                assert!(identities.insert(sandbox_identity(&log)), "{log}");
+                templates.push(clone_template(&log, "noNic"));
+                diagnostics.push_str(&String::from_utf8_lossy(&output.stderr));
             }
+            assert!(templates.iter().all(|template| template == &templates[0]));
+            assert_no_sandbox_state(&agent_state_directory(local_app_data.path()));
+            (templates.remove(0), diagnostics)
         };
 
-        let output = executor_output_with_env(&request, false, false, &offline);
+        // Keep the failed pull control out of the empty store used by the first-capture race.
+        let unregistered = tempfile::tempdir().expect("unregistered image control");
+        let output = executor_output_with_env(
+            &request,
+            false,
+            false,
+            &[
+                ("LOCALAPPDATA", unregistered.path().as_os_str()),
+                offline[1],
+                offline[2],
+            ],
+        );
         assert_ne!(
             output.status.code(),
             Some(0),
@@ -1290,9 +1431,428 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         );
 
         // Concurrent first requests race to register the image, and each must boot it.
-        run_concurrently(&state);
+        let (first, captures) = run_concurrently(&state);
+        assert_template_captures(&captures, 1);
         // Later concurrent requests boot the registered image without the registry.
-        run_concurrently(&offline);
-        println!("VM_EXECUTED executor registered-image reuse offline and concurrent");
+        let (later, captures) = run_concurrently(&offline);
+        assert_template_captures(&captures, 0);
+        assert_eq!(first, later, "registered-image reuse recaptured a template");
+        println!(
+            "VM_EXECUTED executor registered-image reuse offline concurrent first-capture clone isolation"
+        );
+    }
+
+    #[test]
+    #[ignore = "VM: requires separately built wxc-exec.exe, WHP and exact signed official bundle"]
+    fn signed_bundle_executor_starts_sandboxes_from_platform_snapshots() {
+        const CHILD: &str = "MXC_NVX_PLATFORM_SNAPSHOTS_CHILD";
+        const TEST: &str =
+            "windows_x64::signed_bundle_executor_starts_sandboxes_from_platform_snapshots";
+        if let Some(mode) = std::env::var_os(CHILD) {
+            let fallback = mode == "fallback";
+            exercise_sdk_snapshot_requests(fallback);
+            if fallback {
+                let local_app_data = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
+                std::fs::remove_file(agent_state_directory(&local_app_data).join("templates"))
+                    .expect("unblock template store");
+                // A failed capture is not remembered after the store becomes usable.
+                let output =
+                    sdk_json_output(&snapshot_request(&nonce(), "recovered", false), false);
+                assert_eq!(output.outcome, WaitResult::Exited(42));
+                assert_snapshot_output(&output.stdout, "recovered", true);
+                assert!(!output
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(SNAPSHOT_WARNING)));
+            }
+            return;
+        }
+
+        let local_app_data = tempfile::tempdir().expect("isolated LOCALAPPDATA");
+        let environment = [("LOCALAPPDATA", local_app_data.path().as_os_str())];
+        let marker = nonce();
+        let mut templates = BTreeMap::new();
+        let mut identities = BTreeSet::new();
+        for (index, nic) in [false, true, false, true].into_iter().enumerate() {
+            let label = format!("cli-{index}");
+            let (output, log) = executor_output_with_log(
+                &snapshot_request(&marker, &label, nic),
+                false,
+                false,
+                &environment,
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(42),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_snapshot_output(&output.stdout, &label, true);
+            assert!(String::from_utf8_lossy(&output.stderr).contains("snapshot-stderr"));
+            assert_template_captures(
+                &String::from_utf8_lossy(&output.stderr),
+                usize::from(index == 0),
+            );
+            let class = if nic { "nic" } else { "noNic" };
+            let template = clone_template(&log, class);
+            if let Some(previous) = templates.insert(class, template.clone()) {
+                assert_eq!(previous, template, "fresh executor recaptured {class}");
+            }
+            assert!(identities.insert(sandbox_identity(&log)), "{log}");
+            assert_no_sandbox_state(&agent_state_directory(local_app_data.path()));
+        }
+        println!(
+            "VM_EXECUTED executor platform snapshot NIC/noNIC clones stable templates and isolated VMs"
+        );
+
+        let sdk = tempfile::tempdir().expect("isolated SDK LOCALAPPDATA");
+        let output = Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", TEST, "--ignored", "--nocapture"])
+            .env(CHILD, "sdk")
+            .env("LOCALAPPDATA", sdk.path())
+            .stdin(Stdio::null())
+            .output()
+            .expect("SDK snapshot helper");
+        assert_helper_success(&output);
+        assert_template_captures(&String::from_utf8_lossy(&output.stderr), 1);
+        println!(
+            "VM_EXECUTED SDK JSON platform snapshot repeated capture/streaming clones and isolation"
+        );
+
+        let blocked = tempfile::tempdir().expect("isolated LOCALAPPDATA");
+        let state = [("LOCALAPPDATA", blocked.path().as_os_str())];
+        let valid = process_only_request("printf forbidden");
+        let mut native_rejected = valid.clone();
+        native_rejected["runtimeConfig"] = json!({"networkProxy": "http://[::1]:3128"});
+        let mut malformed = valid.clone();
+        malformed["microvm"]["provision"] = json!({"memoryMib": 0});
+        for (request, succeeds) in [
+            (&valid, true),
+            (&native_rejected, false),
+            (&malformed, false),
+        ] {
+            let (output, log) = executor_output_with_log(request, false, true, &state);
+            assert_eq!(output.status.success(), succeeds, "{output:?}");
+            assert!(
+                !String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line == "forbidden"),
+                "{output:?}"
+            );
+            assert!(!log.contains("NVX sandbox started:"), "{log}");
+            assert_template_captures(&String::from_utf8_lossy(&output.stderr), 0);
+            assert_no_sandbox_state(&agent_state_directory(blocked.path()));
+        }
+        let templates = agent_state_directory(blocked.path()).join("templates");
+        assert!(!templates.exists());
+        std::fs::write(&templates, b"not a template store").expect("block the template store");
+        let (output, log) =
+            executor_output_with_log(&process_only_request("printf cold"), false, false, &state);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(output.stdout, b"cold");
+        assert!(log.contains(SNAPSHOT_WARNING), "{log}");
+        assert_cold_start(&log);
+        let output = Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", TEST, "--ignored", "--nocapture"])
+            .env(CHILD, "fallback")
+            .env("LOCALAPPDATA", blocked.path())
+            .stdin(Stdio::null())
+            .output()
+            .expect("SDK fallback helper");
+        assert_helper_success(&output);
+        assert_template_captures(&String::from_utf8_lossy(&output.stderr), 1);
+        println!(
+            "VM_EXECUTED SDK JSON platform snapshot cold fallback warnings capture/streaming and recovery"
+        );
+    }
+
+    const SNAPSHOT_WARNING: &str = "NVX platform snapshots are unavailable";
+    const PLATFORM_TEMPLATE_PARAMETER: &str = "nvx_snapshot_tier=platform";
+
+    fn assert_helper_success(output: &Output) {
+        assert!(
+            output.status.success(),
+            "helper failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for bytes in [&output.stdout, &output.stderr] {
+            assert!(
+                !String::from_utf8_lossy(bytes).contains("synthetic"),
+                "helper leaked credentials"
+            );
+        }
+    }
+
+    fn assert_template_captures(stderr: &str, per_class: usize) {
+        let captures: Vec<_> = stderr
+            .lines()
+            .filter(|line| line.contains("captured generation "))
+            .collect();
+        assert_eq!(captures.len(), per_class * 2, "{stderr}");
+        for class in ["noNic", "nic"] {
+            assert_eq!(
+                captures
+                    .iter()
+                    .filter(|line| line.contains(&format!("of the {class} template")))
+                    .count(),
+                per_class,
+                "{stderr}"
+            );
+        }
+    }
+
+    fn start_metadata(log: &str) -> Value {
+        let starts: Vec<Value> = log
+            .lines()
+            .filter_map(|line| line.split_once("NVX sandbox started: "))
+            .map(|(_, metadata)| {
+                serde_json::from_str(metadata).expect("native StartResult metadata")
+            })
+            .collect();
+        assert_eq!(starts.len(), 1, "{log}");
+        let metadata = starts.into_iter().next().unwrap();
+        assert!(metadata["bootMilliseconds"].is_number(), "{metadata}");
+        metadata
+    }
+
+    fn clone_template(log: &str, class: &str) -> Value {
+        let metadata = start_metadata(log);
+        assert_eq!(metadata["bootMode"], "clone", "{metadata}");
+        let template = &metadata["template"];
+        assert_eq!(template["class"], class, "{metadata}");
+        let key = template["key"].as_str().expect("template key");
+        assert!(
+            key.len() == 64
+                && key
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+            "{metadata}"
+        );
+        assert!(
+            template["generation"]
+                .as_u64()
+                .expect("template generation")
+                > 0,
+            "{metadata}"
+        );
+        json!({"key": template["key"], "generation": template["generation"]})
+    }
+
+    fn assert_cold_start(log: &str) {
+        let metadata = start_metadata(log);
+        assert_eq!(metadata["bootMode"], "cold", "{metadata}");
+        assert!(metadata["template"].is_null(), "{metadata}");
+    }
+
+    fn sandbox_identity(log: &str) -> String {
+        let identities: Vec<String> = log
+            .lines()
+            .filter_map(|line| line.find('{').map(|index| &line[index..]))
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["event"] == "mxc.SandboxIdentity")
+            .map(|event| {
+                event["identity"]
+                    .as_str()
+                    .expect("sandbox identity")
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(identities.len(), 1, "{log}");
+        identities.into_iter().next().unwrap()
+    }
+
+    fn snapshot_request(marker: &str, label: &str, nic: bool) -> Value {
+        let nic_test = if nic { "-e" } else { "! -e" };
+        let mut request = process_only_request(&format!(
+            "test ! -e /tmp/{marker} || exit 99; \
+             test {nic_test} /sys/class/net/eth0 || exit 98; \
+             touch /tmp/{marker}; printf '{label}\\n'; cat /proc/cpuinfo; \
+             printf 'NVX_KERNEL_CMDLINE='; cat /proc/cmdline; \
+             printf snapshot-stderr >&2; exit 42"
+        ));
+        if nic {
+            request["network"] = json!({"egress": {"default": "allow"}});
+        }
+        request
+    }
+
+    fn assert_snapshot_output(stdout: &[u8], label: &str, cloned: bool) {
+        assert!(
+            stdout.starts_with(format!("{label}\n").as_bytes()),
+            "{stdout:?}"
+        );
+        assert_host_cpu_profile(stdout);
+        let output = String::from_utf8_lossy(stdout);
+        let command_lines: Vec<_> = output
+            .lines()
+            .filter_map(|line| line.strip_prefix("NVX_KERNEL_CMDLINE="))
+            .collect();
+        assert_eq!(command_lines.len(), 1, "{output}");
+        assert_eq!(
+            command_lines[0]
+                .split_whitespace()
+                .any(|parameter| parameter == PLATFORM_TEMPLATE_PARAMETER),
+            cloned,
+            "unexpected guest boot mode: {output}"
+        );
+    }
+
+    fn sdk_json_output(request: &Value, streaming: bool) -> ExecutionResult {
+        let options = dev::JsonOptions { experimental: true };
+        let output = if streaming {
+            let process = dev::spawn_json(&request.to_string(), options).unwrap();
+            let warnings = process.warnings();
+            let output = process.wait_with_output().unwrap();
+            assert!(warnings
+                .iter()
+                .all(|warning| output.warnings.contains(warning)));
+            assert!(
+                output
+                    .warnings
+                    .iter()
+                    .filter(|warning| warning.contains(SNAPSHOT_WARNING))
+                    .all(|warning| warnings.contains(warning)),
+                "spawn lost its fallback warning"
+            );
+            output
+        } else {
+            dev::run_json(&request.to_string(), options).unwrap()
+        };
+        assert_no_run_state(std::process::id());
+        output
+    }
+
+    fn assert_snapshot_warning(warnings: &[String], sensitive: bool) {
+        assert!(
+            !warnings.iter().any(|warning| warning.contains("synthetic")),
+            "{warnings:?}"
+        );
+        let warnings: Vec<_> = warnings
+            .iter()
+            .filter(|warning| warning.contains(SNAPSHOT_WARNING))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        if sensitive {
+            assert!(warnings[0].contains("withheld"), "{warnings:?}");
+        }
+    }
+
+    fn exercise_sdk_snapshot_requests(fallback: bool) {
+        let marker = nonce();
+        let content = format!("clone-readonly-{marker}");
+        let proxy_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("private proxy port");
+        let proxy = format!(
+            "http://localhost:{}",
+            proxy_listener.local_addr().unwrap().port()
+        );
+        for (index, (streaming, nic)) in
+            [(true, false), (false, true), (true, true), (false, false)]
+                .into_iter()
+                .enumerate()
+        {
+            let label = format!("sdk-{index}");
+            let mut request = snapshot_request(&marker, &label, nic);
+            let mut command = String::new();
+            if nic {
+                request["network"] = json!({"egress": {"default": "deny"}});
+                request["runtimeConfig"] = json!({"networkProxy": proxy.as_str()});
+                command.push_str("test -n \"$HTTPS_PROXY\" || exit 97; ");
+            }
+            let readonly = if !fallback && index == 0 {
+                let directory = tempfile::tempdir().expect("clone read-only fixture");
+                std::fs::write(directory.path().join("input"), content.as_bytes()).unwrap();
+                request["filesystem"] = json!({
+                    "readonlyPaths": [directory.path().to_str().unwrap()]
+                });
+                request["process"]["env"] = json!([format!(
+                    "MXC_NVX_SNAPSHOT_RO={}",
+                    guest_path_for_host_directory(directory.path())
+                )]);
+                request["process"]["inheritDefaultEnv"] = json!(true);
+                command.push_str(&format!(
+                    "test \"$(cat \"$MXC_NVX_SNAPSHOT_RO/input\")\" = '{content}' || exit 96; \
+                     if (printf forbidden >> \"$MXC_NVX_SNAPSHOT_RO/input\") 2>/dev/null; \
+                     then exit 95; fi; "
+                ));
+                Some(directory)
+            } else {
+                None
+            };
+            command.push_str(request["process"]["commandLine"].as_str().unwrap());
+            request["process"]["commandLine"] = json!(command);
+            let output = sdk_json_output(&request, streaming);
+            assert_eq!(output.outcome, WaitResult::Exited(42), "{output:?}");
+            assert_snapshot_output(&output.stdout, &label, !fallback);
+            assert_eq!(output.stderr, b"snapshot-stderr");
+            if let Some(directory) = readonly {
+                assert_eq!(
+                    std::fs::read(directory.path().join("input")).unwrap(),
+                    content.as_bytes()
+                );
+            }
+            if fallback {
+                assert_snapshot_warning(&output.warnings, false);
+            } else {
+                assert!(!output
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(SNAPSHOT_WARNING)));
+            }
+            let local_app_data = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
+            assert_no_sandbox_state(&agent_state_directory(&local_app_data));
+        }
+        if fallback {
+            let mut invalid = process_only_request("printf forbidden");
+            invalid["runtimeConfig"] = json!({
+                "networkProxy": "http://synthetic-user:synthetic-secret@[::1]:3128"
+            });
+            let error = dev::run_json(
+                &invalid.to_string(),
+                dev::JsonOptions { experimental: true },
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::PolicyValidation, "{error}");
+            assert!(error.message.contains("withheld"), "{error}");
+            assert!(!format!("{error:?}").contains("synthetic"));
+            assert_no_run_state(std::process::id());
+        }
+    }
+
+    fn agent_state_directory(local_app_data: &Path) -> PathBuf {
+        let directories: Vec<PathBuf> =
+            std::fs::read_dir(local_app_data.join(r"Microsoft\MXC\nvx"))
+                .expect("agent state directories")
+                .map(|entry| entry.expect("agent state directory").path())
+                .filter(|path| {
+                    path.is_dir()
+                        && path.file_name().unwrap().to_str().is_some_and(|name| {
+                            name.len() == 16 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+                })
+                .collect();
+        assert_eq!(directories.len(), 1, "{directories:?}");
+        directories
+            .into_iter()
+            .next()
+            .expect("agent state directory")
+    }
+
+    fn assert_no_sandbox_state(root: &Path) {
+        let sandboxes: Vec<_> = std::fs::read_dir(root)
+            .expect("agent state listing")
+            .map(|entry| entry.expect("agent state entry").path())
+            .filter(|path| {
+                path.is_dir()
+                    && path.file_name().unwrap().to_str().is_some_and(|name| {
+                        name.len() == 32 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+            })
+            .collect();
+        assert!(
+            sandboxes.is_empty(),
+            "native sandbox state leaked: {sandboxes:?}"
+        );
     }
 }

@@ -192,6 +192,9 @@ fn main() {
         if mode != "missing-sdk-json-discovery" {
             println!("windows_x64::signed_bundle_sdk_json_capture: test");
         }
+        if mode != "missing-sdk-lifecycle-discovery" {
+            println!("windows_x64::signed_bundle_sdk_json_lifecycle: test");
+        }
         if mode != "missing-network-discovery" {
             println!("windows_network::signed_bundle_network_rules_enforce_allow_deny_and_port_selectors: test");
         }
@@ -220,6 +223,12 @@ fn main() {
     if mode != "missing-sdk-json" {
         println!("VM_EXECUTED SDK JSON binary capture timeout limit and cleanup");
     }
+    if mode != "missing-sdk-lifecycle" {
+        println!("VM_EXECUTED SDK JSON lifecycle clone start state reuse live-owner rejection and adoption");
+    }
+    if mode != "missing-executor-lifecycle" {
+        println!("VM_EXECUTED executor lifecycle provision/dry-run clone start cross-process exec and cleanup");
+    }
     if mode != "missing-platform-snapshots" {
         println!("VM_EXECUTED executor platform snapshot NIC/noNIC clones stable templates and isolated VMs");
     }
@@ -227,7 +236,9 @@ fn main() {
         println!("VM_EXECUTED SDK JSON platform snapshot repeated capture/streaming clones and isolation");
     }
     if mode != "missing-snapshot-fallback" {
-        println!("VM_EXECUTED SDK JSON platform snapshot cold fallback warnings capture/streaming and recovery");
+        println!("VM_EXECUTED SDK JSON platform snapshot cold fallback capture/streaming warnings lifecycle diagnostics and recovery");
+    } else {
+        println!("VM_EXECUTED SDK JSON platform snapshot cold fallback warnings capture/streaming/lifecycle and recovery");
     }
     if mode != "missing-json-image" {
         println!("VM_EXECUTED JSON selected-image filesystem read/write/deny and cleanup");
@@ -595,9 +606,11 @@ test("artifact dispatcher executes prebuilt SDK tests and preserves the log", ()
   const log = readFileSync(join(directory, "logs", "microvm-nvx.log"), "utf8");
   assert.match(log, /VM_EXECUTED facade /);
   assert.match(log, /VM_EXECUTED SDK JSON binary capture /);
+  assert.match(log, /VM_EXECUTED SDK JSON lifecycle clone start state reuse live-owner rejection and adoption/);
+  assert.match(log, /VM_EXECUTED executor lifecycle provision\/dry-run clone start cross-process exec and cleanup/);
   assert.match(log, /VM_EXECUTED executor platform snapshot NIC\/noNIC clones stable templates and isolated VMs/);
   assert.match(log, /VM_EXECUTED SDK JSON platform snapshot repeated capture\/streaming clones and isolation/);
-  assert.match(log, /VM_EXECUTED SDK JSON platform snapshot cold fallback warnings capture\/streaming and recovery/);
+  assert.match(log, /VM_EXECUTED SDK JSON platform snapshot cold fallback capture\/streaming warnings lifecycle diagnostics and recovery/);
   assert.match(log, /VM_EXECUTED JSON selected-image filesystem /);
   assert.match(log, /VM_EXECUTED executor /);
   assert.match(log, /VM_EXECUTED executor console interruption capture\/startup\/execution\/owned-vmm\/cleanup/);
@@ -613,6 +626,8 @@ for (const [mode, message] of [
   ["zero-tests", /executed no tests/],
   ["missing-facade", /did not execute the facade VM scenario/],
   ["missing-sdk-json", /did not execute the SDK JSON capture VM scenario/],
+  ["missing-sdk-lifecycle", /did not execute the SDK JSON lifecycle VM scenario/],
+  ["missing-executor-lifecycle", /did not execute the executor lifecycle VM scenario/],
   ["missing-platform-snapshots", /did not execute the executor platform snapshots VM scenario/],
   ["missing-sdk-platform-snapshots", /did not execute the SDK platform snapshots VM scenario/],
   ["missing-snapshot-fallback", /did not execute the snapshot fallback warnings VM scenario/],
@@ -714,6 +729,7 @@ for (const [mode, message] of [
   ["missing-executor-proxy-discovery", /did not discover windows_x64::signed_executor_proxy_validation_withholds_credentials/],
   ["missing-discovery", /did not discover windows_x64::signed_bundle_facade_create_and_run/],
   ["missing-sdk-json-discovery", /did not discover windows_x64::signed_bundle_sdk_json_capture/],
+  ["missing-sdk-lifecycle-discovery", /did not discover windows_x64::signed_bundle_sdk_json_lifecycle/],
   ["missing-interruption-discovery", /did not discover windows_x64::signed_bundle_executor_console_interrupt/],
   ["missing-image-reuse-discovery", /did not discover windows_x64::signed_bundle_executor_reuses_registered_images/],
   ["missing-platform-snapshots-discovery", /did not discover[\s\S]*windows_x64::signed_bundle_executor_starts_sandboxes_from_platform_snapshots/],
@@ -735,6 +751,7 @@ for (const [mode, message] of [
       "missing-executor-proxy-discovery",
       "missing-discovery",
       "missing-sdk-json-discovery",
+      "missing-sdk-lifecycle-discovery",
       "missing-interruption-discovery",
       "missing-image-reuse-discovery",
       "missing-platform-snapshots-discovery",

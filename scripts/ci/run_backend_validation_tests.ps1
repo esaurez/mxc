@@ -458,9 +458,11 @@ function Invoke-MicroVmTests {
     $scenarios = [ordered]@{
         'facade' = 'VM_EXECUTED facade sequential '
         'SDK JSON capture' = 'VM_EXECUTED SDK JSON binary capture timeout limit and cleanup'
+        'SDK JSON lifecycle' = 'VM_EXECUTED SDK JSON lifecycle clone start state reuse live-owner rejection and adoption'
+        'executor lifecycle' = 'VM_EXECUTED executor lifecycle provision/dry-run clone start cross-process exec and cleanup'
         'executor platform snapshots' = 'VM_EXECUTED executor platform snapshot NIC/noNIC clones stable templates and isolated VMs'
         'SDK platform snapshots' = 'VM_EXECUTED SDK JSON platform snapshot repeated capture/streaming clones and isolation'
-        'snapshot fallback warnings' = 'VM_EXECUTED SDK JSON platform snapshot cold fallback warnings capture/streaming and recovery'
+        'snapshot fallback warnings' = 'VM_EXECUTED SDK JSON platform snapshot cold fallback capture/streaming warnings lifecycle diagnostics and recovery'
         'JSON image and policy' = 'VM_EXECUTED JSON selected-image filesystem '
         'executor' = 'VM_EXECUTED executor sequential '
         'executor image reuse' = 'VM_EXECUTED executor registered-image reuse offline concurrent first-capture clone isolation'

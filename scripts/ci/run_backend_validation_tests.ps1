@@ -462,7 +462,7 @@ function Invoke-MicroVmTests {
         'executor lifecycle' = 'VM_EXECUTED executor lifecycle provision/dry-run clone start cross-process exec and cleanup'
         'executor platform snapshots' = 'VM_EXECUTED executor platform snapshot NIC/noNIC clones stable templates and isolated VMs'
         'SDK platform snapshots' = 'VM_EXECUTED SDK JSON platform snapshot repeated capture/streaming clones and isolation'
-        'snapshot fallback warnings' = 'VM_EXECUTED SDK JSON platform snapshot cold fallback warnings capture/streaming/lifecycle and recovery'
+        'snapshot fallback warnings' = 'VM_EXECUTED SDK JSON platform snapshot cold fallback capture/streaming warnings lifecycle diagnostics and recovery'
         'JSON image and policy' = 'VM_EXECUTED JSON selected-image filesystem '
         'executor' = 'VM_EXECUTED executor sequential '
         'executor image reuse' = 'VM_EXECUTED executor registered-image reuse offline concurrent first-capture clone isolation'

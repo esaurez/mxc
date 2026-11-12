@@ -864,11 +864,11 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         assert!(started["result"]["metadata"].is_null(), "{started}");
         let log = std::fs::read_to_string(&log_path).unwrap();
         let binding = if fallback {
-            let warnings: Vec<String> = started["result"]["warnings"]
-                .as_array()
-                .expect("lifecycle fallback warnings")
-                .iter()
-                .map(|warning| warning.as_str().unwrap().to_owned())
+            assert!(started["result"]["warnings"].is_null(), "{started}");
+            let warnings: Vec<String> = log
+                .lines()
+                .filter(|line| line.contains(SNAPSHOT_WARNING))
+                .map(str::to_owned)
                 .collect();
             assert_snapshot_warning(&warnings, true);
             assert_cold_start(&log);
@@ -1922,7 +1922,7 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         assert_helper_success(&output);
         assert_template_captures(&String::from_utf8_lossy(&output.stderr), 1);
         println!(
-            "VM_EXECUTED SDK JSON platform snapshot cold fallback warnings capture/streaming/lifecycle and recovery"
+            "VM_EXECUTED SDK JSON platform snapshot cold fallback capture/streaming warnings lifecycle diagnostics and recovery"
         );
     }
 

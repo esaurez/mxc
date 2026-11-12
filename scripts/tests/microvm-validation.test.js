@@ -236,6 +236,8 @@ fn main() {
         println!("VM_EXECUTED SDK JSON platform snapshot repeated capture/streaming clones and isolation");
     }
     if mode != "missing-snapshot-fallback" {
+        println!("VM_EXECUTED SDK JSON platform snapshot cold fallback capture/streaming warnings lifecycle diagnostics and recovery");
+    } else {
         println!("VM_EXECUTED SDK JSON platform snapshot cold fallback warnings capture/streaming/lifecycle and recovery");
     }
     if mode != "missing-json-image" {
@@ -608,7 +610,7 @@ test("artifact dispatcher executes prebuilt SDK tests and preserves the log", ()
   assert.match(log, /VM_EXECUTED executor lifecycle provision\/dry-run clone start cross-process exec and cleanup/);
   assert.match(log, /VM_EXECUTED executor platform snapshot NIC\/noNIC clones stable templates and isolated VMs/);
   assert.match(log, /VM_EXECUTED SDK JSON platform snapshot repeated capture\/streaming clones and isolation/);
-  assert.match(log, /VM_EXECUTED SDK JSON platform snapshot cold fallback warnings capture\/streaming\/lifecycle and recovery/);
+  assert.match(log, /VM_EXECUTED SDK JSON platform snapshot cold fallback capture\/streaming warnings lifecycle diagnostics and recovery/);
   assert.match(log, /VM_EXECUTED JSON selected-image filesystem /);
   assert.match(log, /VM_EXECUTED executor /);
   assert.match(log, /VM_EXECUTED executor console interruption capture\/startup\/execution\/owned-vmm\/cleanup/);

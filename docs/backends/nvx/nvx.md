@@ -358,9 +358,10 @@ Its boot-console log has no guest boot output, so startup failure diagnostics
 show less of the console.
 
 If execution-platform initialization is unavailable, MXC uses its cold-boot
-client and returns a warning through the existing SDK warning channel. In
-create-and-run executor calls, the warning is printed on standard error; a
-lifecycle `start` returns it in the stdout envelope's `result.warnings`.
+client. Create-and-run calls return a warning through the existing SDK warning
+channel, and the executor prints it on standard error. Lifecycle `start` records
+the fallback only in configured diagnostics, such as `--log-file`, rather than
+adding it to the envelope's `result.warnings`.
 Invalid configuration and handle-close failures remain errors. A start that
 does not fit a template records its cold reason without an initialization
 warning. With `--log-file`, create-and-run and lifecycle starts record

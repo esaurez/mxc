@@ -306,12 +306,13 @@ multiple processes can control one running cloned VM. The rejection assertion
 uses failure and owner liveness, not withheld native error text.
 
 An intentionally blocked template store must cold boot successfully and return
-warnings to captured SDK callers, streaming SDK callers, and lifecycle
-`result.warnings`. These checks retain workload exit codes, validation errors,
-cleanup, and credential redaction. Removing the obstruction must allow the
-same process to capture templates and clone a later request. Child helpers
-receive private `LOCALAPPDATA` directories without changing the suite process's
-environment.
+warnings to captured and streaming SDK callers. Lifecycle `start` must record a
+redacted fallback diagnostic through the caller's configured logging without
+adding a backend warning to its response envelope. These checks retain workload
+exit codes, validation errors, cleanup, and credential redaction. Removing the
+obstruction must allow the same process to capture templates and clone a later
+request. Child helpers receive private `LOCALAPPDATA` directories without
+changing the suite process's environment.
 
 The isolated-console scenario interrupts first capture, startup, and execution.
 Its helper clears inherited Ctrl-C ignoring before spawning the executor.
@@ -329,9 +330,10 @@ require staged test-name discovery (including snapshot and lifecycle tests),
 and unpack the Rust crate package to check that its tests compile. Actual VM
 scenarios run only in the scheduled Windows x64 job. Its dispatcher requires
 completion markers for CLI and SDK snapshots, lifecycle adoption, fallback
-warnings, concurrent image reuse, and all three interruption phases, as well
-as the existing execution and policy scenarios. Missing markers, empty suites,
-skips, ignored tests, and filtered tests fail the job.
+warnings and lifecycle diagnostics, concurrent image reuse, and all three
+interruption phases, as well as the existing execution and policy scenarios.
+Missing markers, empty suites, skips, ignored tests, and filtered tests fail
+the job.
 
 `node --test scripts/tests/microvm-validation.test.js` runs host fixtures for
 these gates, including negative cases that omit required discovered tests or

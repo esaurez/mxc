@@ -19,7 +19,6 @@ pub(crate) struct NvxStateAwareRunner {
     capture_limit: Option<usize>,
     provisioned_id: std::cell::RefCell<Option<SandboxId>>,
     sensitive_proxy: std::cell::Cell<bool>,
-    logger: Logger,
 }
 
 impl NvxStateAwareRunner {
@@ -29,7 +28,6 @@ impl NvxStateAwareRunner {
             capture_limit: None,
             provisioned_id: std::cell::RefCell::new(None),
             sensitive_proxy: std::cell::Cell::new(true),
-            logger: Logger::inherit_thread_diagnostic_sink(),
         }
     }
 
@@ -71,7 +69,11 @@ impl NvxStateAwareRunner {
             })
             .into_iter()
             .collect();
-        let mut result = super::runner::finish_run(primary, cleanup, &mut self.logger);
+        let mut result = super::runner::finish_run(
+            primary,
+            cleanup,
+            &mut Logger::inherit_thread_diagnostic_sink(),
+        );
         if let (Err(error), Some(id)) = (&mut result, self.provisioned_id.get_mut().take()) {
             // Closing a native host can consume its handle even on failure.
             // Keep the provisioned container and return its identity, rather
@@ -98,10 +100,6 @@ impl NvxStateAwareRunner {
             });
         }
         result
-    }
-
-    pub(crate) fn take_warnings(&mut self) -> Vec<String> {
-        self.logger.take_warnings()
     }
 }
 
@@ -168,8 +166,9 @@ impl StatefulSandboxBackend for NvxStateAwareRunner {
             self.client.get_mut().as_mut().ok_or_else(|| {
                 MxcError::backend_error("NVX lifecycle client was already consumed")
             })?;
-        super::runner::prepare_execution(client, true, None, &mut self.logger)?;
-        super::runner::start_sandbox(client, &sandbox_id, true, &mut self.logger)?;
+        let mut logger = Logger::inherit_thread_diagnostic_sink();
+        super::runner::prepare_execution(client, true, None, &mut logger)?;
+        super::runner::start_sandbox(client, &sandbox_id, true, &mut logger)?;
         Ok(StartResult { metadata: None })
     }
 

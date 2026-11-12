@@ -3,6 +3,7 @@
 
 use serde_json::Value;
 
+use crate::mxc_common::logger::Logger;
 use crate::mxc_common::models::{ExecutionRequest, MicroVmProvisionConfig};
 use crate::mxc_common::mxc_error::MxcError;
 use crate::mxc_common::state_aware_backend::{
@@ -18,6 +19,7 @@ pub(crate) struct NvxStateAwareRunner {
     capture_limit: Option<usize>,
     provisioned_id: std::cell::RefCell<Option<SandboxId>>,
     sensitive_proxy: std::cell::Cell<bool>,
+    logger: Logger,
 }
 
 impl NvxStateAwareRunner {
@@ -27,6 +29,7 @@ impl NvxStateAwareRunner {
             capture_limit: None,
             provisioned_id: std::cell::RefCell::new(None),
             sensitive_proxy: std::cell::Cell::new(true),
+            logger: Logger::inherit_thread_diagnostic_sink(),
         }
     }
 
@@ -68,11 +71,7 @@ impl NvxStateAwareRunner {
             })
             .into_iter()
             .collect();
-        let mut result = super::runner::finish_run(
-            primary,
-            cleanup,
-            &mut crate::mxc_common::logger::Logger::new(crate::mxc_common::logger::Mode::Buffer),
-        );
+        let mut result = super::runner::finish_run(primary, cleanup, &mut self.logger);
         if let (Err(error), Some(id)) = (&mut result, self.provisioned_id.get_mut().take()) {
             // Closing a native host can consume its handle even on failure.
             // Keep the provisioned container and return its identity, rather
@@ -99,6 +98,10 @@ impl NvxStateAwareRunner {
             });
         }
         result
+    }
+
+    pub(crate) fn take_warnings(&mut self) -> Vec<String> {
+        self.logger.take_warnings()
     }
 }
 

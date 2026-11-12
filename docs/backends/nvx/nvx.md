@@ -303,19 +303,24 @@ data; confirm that no VM is running before you remove the directory.
 ### Platform snapshots
 
 Create-and-run MicroVMs, with captured or live output, use the agent's
-platform snapshot templates when the requested resources fit. Each start
-creates a separate VM; a template is not a pool of
-running customer VMs. The templates fit one virtual processor and the default
-256 MiB of memory. A request with another `microvm.provision.memoryMib` value
-cold boots with the requested resources instead.
+platform snapshot templates when the requested resources fit. Each start creates
+a separate VM; a template is not a pool of running customer VMs. MXC configures
+the native snapshot host for one virtual processor and 256 MiB of memory,
+matching its default VM resources. A request with another
+`microvm.provision.memoryMib` value cold boots with the requested resources
+instead.
+
+The pinned `aci_edge_sandboxes` crate and its bundled native agent own template
+creation and selection. MXC sets the CPU and memory limits, not the template
+variants.
 
 The native library owns the platform for the SDK process's lifetime. MXC opens
 stable validation and execution configurations and explicitly closes each
 operation's handles; closing a handle does not discard the native platform.
 The first successful execution-configuration open in a state directory can
-synchronously capture two templates, one with a network device and one without.
-Later calls in that process reuse the platform, and other processes reuse the
-templates on disk. Concurrent first requests coordinate capture. Failed
+synchronously capture templates. Later calls in that process reuse the platform,
+and other processes reuse the templates on disk. Concurrent first requests
+coordinate capture. Failed
 initialization is retried by later requests rather than remembered as a
 successful platform.
 
@@ -328,10 +333,8 @@ expired generation; while a generation is unavailable, individual starts may
 cold boot. Reusing the SDK process does not skip MXC's per-operation bundle
 verification or change certificate-revocation checks.
 
-When the agent captures a template, it writes a line such as
-`aci_edge_agent: template store …: captured generation 1 of the noNic template in 605 ms`
-to the process's standard error. In the executor, that stream also carries the
-workload's standard error.
+The bundled native agent reports template capture on the process's standard
+error. In the executor, that stream also carries the workload's standard error.
 
 A clone retains the template's boot-time memory state, including values created
 before capture. The guest reseeds its kernel random generator with fresh
@@ -377,11 +380,10 @@ the executor started have terminated and that a later request succeeds with
 the same agent state directory. Another scenario checks
 that concurrent first requests for an unregistered image all succeed, and that
 later concurrent requests boot it while its registry is unreachable. A third
-checks that create-and-run sandboxes, with and without a network device,
-start as clones of the platform snapshot templates, that a streaming request
-captures the templates too, that validation captures none, and that a host
-that cannot capture them cold boots sandboxes. Requests that native validation
-rejects capture no templates.
+checks that eligible create-and-run sandboxes start as clones of the platform
+snapshot templates, that a streaming request captures the templates too, that
+validation captures none, and that a host that cannot capture them cold boots
+sandboxes. Requests that native validation rejects capture no templates.
 Missing prerequisites, skipped scenarios, and empty test runs fail validation.
 See the [CI validation runbook](../../development/build-and-test/ci-validation-infrastructure.md).
 

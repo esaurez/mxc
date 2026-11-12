@@ -281,14 +281,16 @@ rules. They also check that traffic through a proxy works while direct
 connections are blocked.
 
 Platform snapshot scenarios require parsed native `StartResult` diagnostics,
-not just template files. NIC and no-NIC CLI starts must report clone boot mode,
-the expected class, and a stable template key and generation across fresh
-executor processes. Repeated public `v1::dev::run_json` and `spawn_json`
+not just template files. MXC configures the native snapshot host for one virtual
+processor and 256 MiB of memory; the crate and bundled native agent own template
+creation and selection. Eligible CLI starts must report clone boot mode and a
+stable template key and generation across fresh executor processes for each
+tested configuration. Repeated public `v1::dev::run_json` and `spawn_json`
 calls in one process check the guest's `/proc/cmdline` for the native template
 parameter, `nvx_snapshot_tier=platform`. Guest output, the host CPU profile,
 distinct CLI VM identities, and private guest-file sentinels check that each
-request really runs in its own VM. Native capture diagnostics must show exactly
-one capture per class initially and none in later processes. Concurrent first
+request really runs in its own VM. Native capture diagnostics must show initial
+capture followed by reuse without recapture in later processes. Concurrent first
 requests exercise both template capture and image registration; later concurrent
 requests must still clone the same template with the registry unreachable.
 

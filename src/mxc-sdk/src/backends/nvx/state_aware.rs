@@ -163,9 +163,13 @@ impl StatefulSandboxBackend for NvxStateAwareRunner {
         _config: Option<Self::StartConfig>,
     ) -> Result<StartResult<Self::StartMetadata>, MxcError> {
         let sandbox_id = SandboxId::from_mxc(sandbox_id)?;
-        self.client()?
-            .start(&sandbox_id)
-            .map_err(|error| super::runner::protect_native_error(error, "start", true))?;
+        let _ = self.client()?;
+        let client =
+            self.client.get_mut().as_mut().ok_or_else(|| {
+                MxcError::backend_error("NVX lifecycle client was already consumed")
+            })?;
+        super::runner::prepare_execution(client, true, None, &mut self.logger)?;
+        super::runner::start_sandbox(client, &sandbox_id, true, &mut self.logger)?;
         Ok(StartResult { metadata: None })
     }
 

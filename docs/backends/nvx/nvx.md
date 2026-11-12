@@ -302,9 +302,9 @@ data; confirm that no VM is running before you remove the directory.
 
 ### Platform snapshots
 
-Create-and-run MicroVMs, with captured or live output, use the agent's
-platform snapshot templates when the requested resources fit. Each start
-creates a separate VM; a template is not a pool of
+Create-and-run MicroVMs, with captured or live output, and lifecycle `start`
+operations use the agent's platform snapshot templates when the requested
+resources fit. Each start creates a separate VM; a template is not a pool of
 running customer VMs. The templates fit one virtual processor and the default
 256 MiB of memory. A request with another `microvm.provision.memoryMib` value
 cold boots with the requested resources instead.
@@ -319,14 +319,27 @@ templates on disk. Concurrent first requests coordinate capture. Failed
 initialization is retried by later requests rather than remembered as a
 successful platform.
 
-Request validation and host probing precede capture. Dry runs and lifecycle
-operations do not initialize templates. First-use capture costs additional time
-and disk space; neither is a fixed latency or allocation guarantee. The native
-runtime expires generations after 30 days and
+Request validation and host probing precede capture. Dry runs, lifecycle
+provision, exec, stop, and deprovision do not initialize templates. The two
+[state roots](#agent-state-directory) keep separate template stores. First-use
+capture costs additional time and disk space; neither is a fixed latency or
+allocation guarantee. The native runtime expires generations after 30 days and
 quarantines faulty generations. A fresh process may synchronously recapture an
 expired generation; while a generation is unavailable, individual starts may
 cold boot. Reusing the SDK process does not skip MXC's per-operation bundle
 verification or change certificate-revocation checks.
+
+A running restored VM has one controlling process. Several independent VMs can
+use the same template concurrently, but another process cannot exec or stop
+that same VM while its controller process remains alive. Closing its SDK
+handles does not release that process-owned controller. Use the same process
+for those operations, or hand control to another process after the original
+process exits. The runtime verifies the running VM's identity before adopting
+it. Separate executor invocations can therefore perform lifecycle operations
+sequentially after each preceding invocation exits.
+Existing-container errors withhold native details to protect possible proxy
+credentials, so a lifecycle exec or stop error with withheld details can also
+mean that another live process controls the VM.
 
 When the agent captures a template, it writes a line such as
 `aci_edge_agent: template store …: captured generation 1 of the noNic template in 605 ms`
@@ -346,10 +359,11 @@ show less of the console.
 
 If execution-platform initialization is unavailable, MXC uses its cold-boot
 client and returns a warning through the existing SDK warning channel. In
-create-and-run executor calls, the warning is printed on standard error.
+create-and-run executor calls, the warning is printed on standard error; a
+lifecycle `start` returns it in the stdout envelope's `result.warnings`.
 Invalid configuration and handle-close failures remain errors. A start that
 does not fit a template records its cold reason without an initialization
-warning. With `--log-file`, create-and-run starts record
+warning. With `--log-file`, create-and-run and lifecycle starts record
 `bootMode` (`clone` or `cold`), `template` or `coldReason`, and
 `bootMilliseconds`.
 

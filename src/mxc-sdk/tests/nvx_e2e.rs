@@ -208,8 +208,9 @@ mod windows_x64 {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Component, Path, PathBuf, Prefix};
     use std::process::{Command, Output, Stdio};
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use mxc_sdk::mxc_common::logger::{Logger, Mode};
     use mxc_sdk::v1::{ExecutionResult, WaitResult};
     use serde_json::{json, Value};
 
@@ -731,11 +732,11 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         assert_eq!(error.code, ErrorCode::BackendError);
         assert_eq!(error.message, CAPTURE_ERROR);
         assert_no_run_state(std::process::id());
-        exercise_streaming_and_lifecycle();
+        exercise_streaming_capture();
         println!("VM_EXECUTED SDK JSON binary capture timeout limit and cleanup");
     }
 
-    fn exercise_streaming_and_lifecycle() {
+    fn exercise_streaming_capture() {
         let options = dev::JsonOptions { experimental: true };
         let command = "head -c 131072 /dev/zero; head -c 131072 /dev/zero >&2; exit 42";
         let process = dev::spawn_json(&process_only_request(command).to_string(), options).unwrap();
@@ -744,66 +745,415 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         assert_eq!(output.stdout, vec![0; 131072]);
         assert_eq!(output.stderr, vec![0; 131072]);
         assert_no_run_state(std::process::id());
+    }
 
-        struct Container {
-            id: String,
-            cleaned: bool,
-        }
-        impl Drop for Container {
-            fn drop(&mut self) {
-                if self.cleaned {
-                    return;
-                }
-                let options = dev::JsonOptions { experimental: true };
-                let phase = |name| {
-                    json!({
-                        "version": "1.1.0-alpha", "phase": name, "sandboxId": self.id
-                    })
-                    .to_string()
-                };
-                if let Err(error) = dev::stop_container_json(&phase("stop"), options) {
-                    eprintln!("lifecycle fixture stop failed: {error}");
-                }
-                if let Err(error) = dev::deprovision_container_json(&phase("deprovision"), options)
-                {
-                    eprintln!("lifecycle fixture deprovision failed: {error}");
-                }
-            }
-        }
+    fn lifecycle_phase(id: &str, phase: &str) -> Value {
+        json!({"version": "1.1.0-alpha", "phase": phase, "sandboxId": id})
+    }
+
+    fn lifecycle_provision() -> Value {
         let mut provision = process_only_request("unused");
         provision.as_object_mut().unwrap().remove("process");
         provision["phase"] = json!("provision");
+        provision
+    }
+
+    struct LifecycleContainer {
+        id: String,
+        local_app_data: Option<PathBuf>,
+        cleaned: bool,
+    }
+
+    impl Drop for LifecycleContainer {
+        fn drop(&mut self) {
+            if self.cleaned {
+                return;
+            }
+            for phase in ["stop", "deprovision"] {
+                let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let request = lifecycle_phase(&self.id, phase);
+                    if let Some(local_app_data) = &self.local_app_data {
+                        let output = executor_output_with_env(
+                            &request,
+                            false,
+                            false,
+                            &[("LOCALAPPDATA", local_app_data.as_os_str())],
+                        );
+                        if output.status.success() {
+                            Ok(())
+                        } else {
+                            Err(String::from_utf8_lossy(&output.stderr).into_owned())
+                        }
+                    } else {
+                        let options = dev::JsonOptions { experimental: true };
+                        let result = if phase == "stop" {
+                            dev::stop_container_json(&request.to_string(), options)
+                        } else {
+                            dev::deprovision_container_json(&request.to_string(), options)
+                        };
+                        result.map(|_| ()).map_err(|error| error.to_string())
+                    }
+                }));
+                match cleanup {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eprintln!("lifecycle fixture {phase} failed: {error}"),
+                    Err(_) => eprintln!("lifecycle fixture {phase} cleanup panicked"),
+                }
+            }
+        }
+    }
+
+    fn exercise_sdk_lifecycle(fallback: bool, hold_owner: bool) {
+        let options = dev::JsonOptions { experimental: true };
+        let local_app_data = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
+        let root = local_app_data.join(r"Microsoft\MXC\nvx");
+        let templates = root.join("templates");
+        let assert_not_captured = || {
+            assert_eq!(
+                templates.exists(),
+                fallback,
+                "unexpected template store: {templates:?}"
+            );
+            assert!(
+                !templates.is_dir(),
+                "lifecycle validation or provision captured templates"
+            );
+        };
+        let log_path = local_app_data.join("sdk-lifecycle.log");
+        let mut logger = Logger::new(Mode::Buffer);
+        logger
+            .enable_file_sink(&log_path)
+            .expect("lifecycle diagnostic sink");
+        let _sink = logger.install_thread_diagnostic_sink();
+        let mut provision = lifecycle_provision();
+        let proxy_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("private proxy port");
+        if fallback {
+            provision["network"] = json!({"egress": {"default": "deny"}});
+            provision["runtimeConfig"] = json!({
+                "networkProxy": format!(
+                    "http://localhost:{}",
+                    proxy_listener.local_addr().unwrap().port()
+                )
+            });
+        }
+        dev::validate_provision_json(&provision.to_string(), options).unwrap();
+        assert_not_captured();
         let result: Value = serde_json::from_str(
             &dev::provision_container_json(&provision.to_string(), options).unwrap(),
         )
         .unwrap();
-        let mut container = Container {
+        let mut container = LifecycleContainer {
             id: result["result"]["sandboxId"].as_str().unwrap().to_owned(),
+            local_app_data: None,
             cleaned: false,
         };
         assert!(container.id.starts_with("microvm:"));
-        let phase = |name| {
-            json!({
-                "version": "1.1.0-alpha", "phase": name, "sandboxId": container.id
-            })
+        if hold_owner {
+            std::fs::write(local_app_data.join("lifecycle-id"), &container.id).unwrap();
+        }
+        assert_not_captured();
+        let start = lifecycle_phase(&container.id, "start").to_string();
+        dev::validate_start_json(&start, options).unwrap();
+        assert_not_captured();
+        assert!(!std::fs::read_to_string(&log_path)
+            .unwrap()
+            .contains("NVX sandbox started:"));
+        let started: Value =
+            serde_json::from_str(&dev::start_container_json(&start, options).unwrap()).unwrap();
+        assert!(started["result"]["metadata"].is_null(), "{started}");
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        let binding = if fallback {
+            let warnings: Vec<String> = started["result"]["warnings"]
+                .as_array()
+                .expect("lifecycle fallback warnings")
+                .iter()
+                .map(|warning| warning.as_str().unwrap().to_owned())
+                .collect();
+            assert_snapshot_warning(&warnings, true);
+            assert_cold_start(&log);
+            assert!(!templates.is_dir());
+            assert!(!lifecycle_sandbox_directory(&root, &container.id)
+                .join("clone.json")
+                .exists());
+            None
+        } else {
+            let template = clone_template(&log, "noNic");
+            assert!(templates.is_dir());
+            Some((
+                template.clone(),
+                assert_clone_binding(&root, &container.id, &template),
+            ))
         };
-        dev::start_container_json(&phase("start").to_string(), options).unwrap();
-        let mut exec = phase("exec");
+        assert!(!log.contains("synthetic"), "{log}");
+
+        let marker = nonce();
+        let command = format!(
+            "test ! -e /tmp/{marker} || exit 99; printf '{marker}' > /tmp/{marker}; \
+             head -c 131072 /dev/zero; head -c 131072 /dev/zero >&2; exit 42"
+        );
+        let mut exec = lifecycle_phase(&container.id, "exec");
         exec["process"] = json!({"commandLine": command, "timeout": 30000});
         let process = dev::spawn_in_container_json(&exec.to_string(), options).unwrap();
         let output = process.wait_with_output().unwrap();
         assert_eq!(output.outcome, WaitResult::Exited(42));
         assert_eq!(output.stdout, vec![0; 131072]);
         assert_eq!(output.stderr, vec![0; 131072]);
-        exec["process"] = json!({"commandLine": "printf container-reused", "timeout": 30000});
+        exec["process"] = json!({
+            "commandLine": format!("test \"$(cat /tmp/{marker})\" = '{marker}' && printf container-reused"),
+            "timeout": 30000
+        });
         let output = dev::run_in_container_json(&exec.to_string(), options).unwrap();
         assert_eq!(output.outcome, WaitResult::Exited(0));
         assert_eq!(output.stdout, b"container-reused");
         assert!(output.stderr.is_empty());
-        dev::stop_container_json(&phase("stop").to_string(), options).unwrap();
-        dev::deprovision_container_json(&phase("deprovision").to_string(), options).unwrap();
-        // Explicit cleanup above is asserted; Drop is only for failed assertions.
+        if let Some((template, binding)) = &binding {
+            assert_eq!(
+                assert_clone_binding(&root, &container.id, template),
+                *binding
+            );
+        }
+        if hold_owner {
+            std::fs::write(
+                local_app_data.join("lifecycle-ready.pending"),
+                json!({"sandboxId": container.id, "marker": marker}).to_string(),
+            )
+            .unwrap();
+            std::fs::rename(
+                local_app_data.join("lifecycle-ready.pending"),
+                local_app_data.join("lifecycle-ready.json"),
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(180);
+            while !local_app_data.join("lifecycle-release").exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "lifecycle owner was not released"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // Native clone ownership lasts until this process exits, not until SDK handles close.
+            container.cleaned = true;
+            return;
+        }
+        dev::stop_container_json(&lifecycle_phase(&container.id, "stop").to_string(), options)
+            .unwrap();
+        let sandbox = lifecycle_sandbox_directory(&root, &container.id);
+        assert!(
+            !sandbox.join("clone.json").exists(),
+            "stop retained the template lease"
+        );
+        dev::deprovision_container_json(
+            &lifecycle_phase(&container.id, "deprovision").to_string(),
+            options,
+        )
+        .unwrap();
+        assert!(
+            !sandbox.exists(),
+            "deprovision retained native sandbox state"
+        );
         container.cleaned = true;
+    }
+
+    fn exercise_executor_lifecycle(local_app_data: &Path) {
+        let environment = [("LOCALAPPDATA", local_app_data.as_os_str())];
+        let templates = local_app_data.join(r"Microsoft\MXC\nvx\templates");
+        let provision = lifecycle_provision();
+        let (output, _) = executor_output_with_log(&provision, false, true, &environment);
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            !templates.exists(),
+            "CLI provision dry-run captured templates"
+        );
+        assert_template_captures(&String::from_utf8_lossy(&output.stderr), 0);
+        let (output, _) = executor_output_with_log(&provision, false, false, &environment);
+        assert!(output.status.success(), "{output:?}");
+        assert!(!templates.exists(), "CLI provision captured templates");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let mut container = LifecycleContainer {
+            id: result["result"]["sandboxId"].as_str().unwrap().to_owned(),
+            local_app_data: Some(local_app_data.to_owned()),
+            cleaned: false,
+        };
+        let start = lifecycle_phase(&container.id, "start");
+        let (output, _) = executor_output_with_log(&start, false, true, &environment);
+        assert!(output.status.success(), "{output:?}");
+        assert!(!templates.exists(), "CLI start dry-run captured templates");
+        let (output, log) = executor_output_with_log(&start, false, false, &environment);
+        assert!(output.status.success(), "{output:?}");
+        let template = clone_template(&log, "noNic");
+        let root = local_app_data.join(r"Microsoft\MXC\nvx");
+        let binding = assert_clone_binding(&root, &container.id, &template);
+        assert_template_captures(&String::from_utf8_lossy(&output.stderr), 1);
+        let marker = nonce();
+        for (command, expected) in [
+            (format!("test ! -e /tmp/{marker} && printf '{marker}' > /tmp/{marker} && printf first-exec"), b"first-exec".as_slice()),
+            (format!("test \"$(cat /tmp/{marker})\" = '{marker}' && printf later-exec"), b"later-exec".as_slice()),
+        ] {
+            let mut exec = lifecycle_phase(&container.id, "exec");
+            exec["process"] = json!({"commandLine": command, "timeout": 30000});
+            let (output, log) = executor_output_with_log(&exec, false, false, &environment);
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            assert_eq!(output.stdout, expected);
+            assert!(!log.contains("NVX sandbox started:"), "exec restarted the VM: {log}");
+            assert_template_captures(&String::from_utf8_lossy(&output.stderr), 0);
+            assert_eq!(assert_clone_binding(&root, &container.id, &template), binding);
+        }
+        for phase in ["stop", "deprovision"] {
+            let output = executor_output_with_env(
+                &lifecycle_phase(&container.id, phase),
+                false,
+                false,
+                &environment,
+            );
+            assert!(output.status.success(), "{output:?}");
+            assert!(!lifecycle_sandbox_directory(&root, &container.id)
+                .join("clone.json")
+                .exists());
+        }
+        assert!(!lifecycle_sandbox_directory(&root, &container.id).exists());
+        container.cleaned = true;
+        println!(
+            "VM_EXECUTED executor lifecycle provision/dry-run clone start cross-process exec and cleanup"
+        );
+    }
+
+    struct LifecycleOwner {
+        child: std::process::Child,
+        local_app_data: PathBuf,
+        cleaned: bool,
+    }
+
+    impl Drop for LifecycleOwner {
+        fn drop(&mut self) {
+            if !matches!(self.child.try_wait(), Ok(Some(_))) {
+                if let Err(error) = self.child.kill() {
+                    eprintln!("lifecycle owner cleanup failed: {error}");
+                }
+                if let Err(error) = self.child.wait() {
+                    eprintln!("lifecycle owner wait failed: {error}");
+                }
+            }
+            if !self.cleaned {
+                if let Ok(id) = std::fs::read_to_string(self.local_app_data.join("lifecycle-id")) {
+                    let _container = LifecycleContainer {
+                        id,
+                        local_app_data: Some(self.local_app_data.clone()),
+                        cleaned: false,
+                    };
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "VM: requires separately built wxc-exec.exe, WHP and exact signed official bundle"]
+    fn signed_bundle_sdk_json_lifecycle() {
+        const CHILD: &str = "MXC_NVX_LIFECYCLE_OWNER_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            exercise_sdk_lifecycle(false, true);
+            return;
+        }
+        let cli = tempfile::tempdir().expect("isolated CLI lifecycle LOCALAPPDATA");
+        exercise_executor_lifecycle(cli.path());
+        let local_app_data = tempfile::tempdir().expect("isolated lifecycle owner LOCALAPPDATA");
+        let stdout_path = local_app_data.path().join("owner.stdout");
+        let stderr_path = local_app_data.path().join("owner.stderr");
+        let mut owner = LifecycleOwner {
+            child: Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "windows_x64::signed_bundle_sdk_json_lifecycle",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("LOCALAPPDATA", local_app_data.path())
+                .stdin(Stdio::null())
+                .stdout(std::fs::File::create(&stdout_path).unwrap())
+                .stderr(std::fs::File::create(&stderr_path).unwrap())
+                .spawn()
+                .expect("lifecycle owner helper"),
+            local_app_data: local_app_data.path().to_owned(),
+            cleaned: false,
+        };
+        let ready = local_app_data.path().join("lifecycle-ready.json");
+        let deadline = Instant::now() + Duration::from_secs(180);
+        while !ready.exists() {
+            assert!(
+                owner.child.try_wait().unwrap().is_none(),
+                "lifecycle owner exited before ready\n{}\n{}",
+                std::fs::read_to_string(&stdout_path).unwrap(),
+                std::fs::read_to_string(&stderr_path).unwrap()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "lifecycle owner never became ready"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let ready: Value = serde_json::from_slice(&std::fs::read(ready).unwrap()).unwrap();
+        let id = ready["sandboxId"].as_str().unwrap();
+        let marker = ready["marker"].as_str().unwrap();
+        let root = local_app_data.path().join(r"Microsoft\MXC\nvx");
+        let template = clone_template(
+            &std::fs::read_to_string(local_app_data.path().join("sdk-lifecycle.log")).unwrap(),
+            "noNic",
+        );
+        let binding = assert_clone_binding(&root, id, &template);
+        let environment = [("LOCALAPPDATA", local_app_data.path().as_os_str())];
+        let mut exec = lifecycle_phase(id, "exec");
+        exec["process"] =
+            json!({"commandLine": "printf forbidden-live-adoption", "timeout": 30000});
+        assert!(owner.child.try_wait().unwrap().is_none());
+        let output = executor_output_with_env(&exec, false, false, &environment);
+        assert!(
+            !output.status.success(),
+            "a live clone controller was replaced: {output:?}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("forbidden-live-adoption"));
+        assert!(
+            owner.child.try_wait().unwrap().is_none(),
+            "owner exited during rejection"
+        );
+        assert_eq!(assert_clone_binding(&root, id, &template), binding);
+        std::fs::write(local_app_data.path().join("lifecycle-release"), b"release").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(180);
+        let status = loop {
+            if let Some(status) = owner.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "lifecycle owner did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            status.success(),
+            "lifecycle owner failed\n{}\n{}",
+            std::fs::read_to_string(&stdout_path).unwrap(),
+            std::fs::read_to_string(&stderr_path).unwrap()
+        );
+        assert_template_captures(&std::fs::read_to_string(&stderr_path).unwrap(), 1);
+        exec["process"] = json!({
+            "commandLine": format!("test \"$(cat /tmp/{marker})\" = '{marker}' && printf adopted-after-exit"),
+            "timeout": 30000
+        });
+        let output = executor_output_with_env(&exec, false, false, &environment);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(output.stdout, b"adopted-after-exit");
+        assert_eq!(assert_clone_binding(&root, id, &template), binding);
+        for phase in ["stop", "deprovision"] {
+            let output =
+                executor_output_with_env(&lifecycle_phase(id, phase), false, false, &environment);
+            assert!(output.status.success(), "{output:?}");
+            assert!(!lifecycle_sandbox_directory(&root, id)
+                .join("clone.json")
+                .exists());
+        }
+        assert!(!lifecycle_sandbox_directory(&root, id).exists());
+        owner.cleaned = true;
+        println!(
+            "VM_EXECUTED SDK JSON lifecycle clone start state reuse live-owner rejection and adoption"
+        );
     }
 
     #[test]
@@ -1452,9 +1802,14 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
             let fallback = mode == "fallback";
             exercise_sdk_snapshot_requests(fallback);
             if fallback {
+                exercise_sdk_lifecycle(true, false);
                 let local_app_data = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
-                std::fs::remove_file(agent_state_directory(&local_app_data).join("templates"))
-                    .expect("unblock template store");
+                for root in [
+                    agent_state_directory(&local_app_data),
+                    local_app_data.join(r"Microsoft\MXC\nvx"),
+                ] {
+                    std::fs::remove_file(root.join("templates")).expect("unblock template store");
+                }
                 // A failed capture is not remembered after the store becomes usable.
                 let output =
                     sdk_json_output(&snapshot_request(&nonce(), "recovered", false), false);
@@ -1546,6 +1901,11 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         let templates = agent_state_directory(blocked.path()).join("templates");
         assert!(!templates.exists());
         std::fs::write(&templates, b"not a template store").expect("block the template store");
+        std::fs::write(
+            blocked.path().join(r"Microsoft\MXC\nvx\templates"),
+            b"not a lifecycle template store",
+        )
+        .expect("block the lifecycle template store");
         let (output, log) =
             executor_output_with_log(&process_only_request("printf cold"), false, false, &state);
         assert_eq!(output.status.code(), Some(0), "{output:?}");
@@ -1562,7 +1922,7 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         assert_helper_success(&output);
         assert_template_captures(&String::from_utf8_lossy(&output.stderr), 1);
         println!(
-            "VM_EXECUTED SDK JSON platform snapshot cold fallback warnings capture/streaming and recovery"
+            "VM_EXECUTED SDK JSON platform snapshot cold fallback warnings capture/streaming/lifecycle and recovery"
         );
     }
 
@@ -1643,6 +2003,49 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         let metadata = start_metadata(log);
         assert_eq!(metadata["bootMode"], "cold", "{metadata}");
         assert!(metadata["template"].is_null(), "{metadata}");
+    }
+
+    fn lifecycle_sandbox_directory(root: &Path, id: &str) -> PathBuf {
+        root.join(id.strip_prefix("microvm:").expect("MicroVM lifecycle ID"))
+    }
+
+    fn assert_clone_binding(root: &Path, id: &str, template: &Value) -> Value {
+        let sandbox = lifecycle_sandbox_directory(root, id);
+        let binding: Value = serde_json::from_slice(
+            &std::fs::read(sandbox.join("clone.json")).expect("native clone lease binding"),
+        )
+        .expect("native clone lease JSON");
+        assert_eq!(binding["key"], template["key"], "{binding}");
+        assert_eq!(binding["generation"], template["generation"], "{binding}");
+        assert!(
+            !binding["lease"]
+                .as_str()
+                .expect("native lease ID")
+                .is_empty(),
+            "{binding}"
+        );
+        assert!(
+            !binding["launch"]
+                .as_str()
+                .expect("native launch ID")
+                .is_empty(),
+            "{binding}"
+        );
+        assert_eq!(
+            Path::new(binding["sandbox"].as_str().expect("native sandbox path"))
+                .canonicalize()
+                .unwrap(),
+            sandbox.canonicalize().unwrap()
+        );
+        assert!(
+            sandbox.join("runtime.json").is_file(),
+            "clone has no running VM record"
+        );
+        assert!(
+            sandbox.join("clone-holder.lock").is_file(),
+            "clone has no controller record"
+        );
+        binding
     }
 
     fn sandbox_identity(log: &str) -> String {

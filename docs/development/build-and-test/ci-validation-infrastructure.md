@@ -292,9 +292,22 @@ one capture per class initially and none in later processes. Concurrent first
 requests exercise both template capture and image registration; later concurrent
 requests must still clone the same template with the registry unreachable.
 
+Lifecycle scenarios require provision and dry-run validation to leave templates
+uncaptured, followed by a clone start and live and captured execs that preserve
+guest state. The live VM's native `clone.json` lease must match the logged
+template key and generation and remain unchanged across execs and adoption;
+stop must release it and deprovision must remove the sandbox state.
+Separate CLI processes provision, start, execute twice, stop,
+and deprovision. A separate SDK helper stays alive after its handles close:
+another process must fail to execute in that running clone while the helper
+lives, then successfully adopt it and read the same guest state after the
+helper exits. Different VM IDs can run concurrently; this does not imply
+multiple processes can control one running cloned VM. The rejection assertion
+uses failure and owner liveness, not withheld native error text.
+
 An intentionally blocked template store must cold boot successfully and return
-warnings to captured and streaming SDK callers. These checks retain workload
-exit codes, validation errors,
+warnings to captured SDK callers, streaming SDK callers, and lifecycle
+`result.warnings`. These checks retain workload exit codes, validation errors,
 cleanup, and credential redaction. Removing the obstruction must allow the
 same process to capture templates and clone a later request. Child helpers
 receive private `LOCALAPPDATA` directories without changing the suite process's
@@ -312,10 +325,10 @@ an IPv4 route through a non-loopback interface to an address outside the guest
 network, `10.0.0.0/24`.
 
 Regular Windows x64 PR builds remain host-only: they verify the signed bundle,
-require staged test-name discovery (including snapshot tests),
+require staged test-name discovery (including snapshot and lifecycle tests),
 and unpack the Rust crate package to check that its tests compile. Actual VM
 scenarios run only in the scheduled Windows x64 job. Its dispatcher requires
-completion markers for CLI and SDK snapshots, fallback
+completion markers for CLI and SDK snapshots, lifecycle adoption, fallback
 warnings, concurrent image reuse, and all three interruption phases, as well
 as the existing execution and policy scenarios. Missing markers, empty suites,
 skips, ignored tests, and filtered tests fail the job.

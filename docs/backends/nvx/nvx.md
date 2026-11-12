@@ -30,9 +30,9 @@ From the repository root, build the executor:
 build.bat --with-microvm
 ```
 
-The `aci_edge_sandboxes` crate, pinned to `0.1.1` with `agent-bundled`,
+The `aci_edge_sandboxes` crate, pinned to `0.1.2` with `agent-bundled`,
 downloads and stages its own signed agent bundle. This version pins release
-`v0.1.0-build188642429` (sandbox ABI 3, guest runtime ABI
+`v0.2.0-build189870623` (sandbox ABI 3, guest runtime ABI
 `microvm-abi-v2-edge-ramfs-v7`). Distribute the complete `aci-edge-sandboxes`
 directory beside the executable, including its manifests, runtime binaries,
 guest images, and provenance files. Do not substitute a standalone OpenVMM
@@ -127,7 +127,7 @@ The table describes this MXC integration, not every capability of NVX. The
 signed agent limits workloads to one hour and constrains their working
 directories and environments as described below. Refusal of UI, writable
 stdin, and PTY operations are restrictions of this MXC integration.
-The [signed-agent documentation](https://docs.rs/aci_edge_sandboxes/0.1.1/aci_edge_sandboxes/agent/)
+The [signed-agent documentation](https://docs.rs/aci_edge_sandboxes/0.1.2/aci_edge_sandboxes/agent/)
 describes its contract; the direct OpenVMM backend uses a different guest and
 does not define the limits of this integration.
 
@@ -180,6 +180,19 @@ later entries override earlier ones.
 case-insensitively. MXC validates these process limits before bundle discovery,
 then validates the mapped request with the native agent before probing the
 host or provisioning a container.
+
+### Runtime proxy
+
+The verified runtime accepts an `http` or `https` proxy on `localhost` or
+`127.0.0.1` with an explicit port other than 0 or 53. It must listen on IPv4
+loopback. Usernames, passwords, nonempty paths, query strings, and fragments in
+the URL are unsupported and rejected before VM creation.
+
+Proxy mode requires `network.egress.default: "deny"` with no allow or deny
+rules, denied ingress, and denied host-loopback access. The runtime permits the
+proxy connection itself; direct egress and proxy mode are separate connectivity
+models. A native error for a credential-bearing URL is withheld to avoid
+exposing the credential.
 
 ### Output, timeout, and cleanup
 
